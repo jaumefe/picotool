@@ -7223,7 +7223,7 @@ bool otp_load_command::execute(device_map &devices) {
     std::unique_ptr<uint8_t[]> unique_verify_buffer(new uint8_t[file_size]());
     uint8_t* verify_buffer = unique_verify_buffer.get();
     picoboot_memory_access raw_access(con);
-    con.otp_read(&otp_cmd, (uint8_t *)verify_buffer, sizeof(verify_buffer));
+    con.otp_read(&otp_cmd, (uint8_t *)verify_buffer, file_size);
     unsigned int i;
     for(i=0;i<file_size;i++) {
         if (file_buffer[i] != verify_buffer[i]) {
