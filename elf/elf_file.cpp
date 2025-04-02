@@ -230,15 +230,6 @@ void elf_file::flatten(void) {
         }
         idx++;
     }
-
-    idx = 0;
-    for (const auto &ph : ph_entries) {
-        if (ph.filez) {
-            elf_bytes.resize(std::max(ph.offset + ph.filez, (uint32_t)elf_bytes.size()));
-            memcpy(&elf_bytes[ph.offset], &ph_data[idx][0], ph.filez);
-        }
-        idx++;
-    }
     if (verbose) printf("Elf file size %zu\n", elf_bytes.size());
 }
 
@@ -260,6 +251,29 @@ void elf_file::read_sh(void) {
     }
 }
 
+// If there are holes between sections within segments, increase the section size to plug the hole
+// This is necessary to ensure the whole segment contains data defined in sections, otherwise you end up
+// signing/hashing/encrypting data that may not be written, as many tools write in sections not segments
+void elf_file::remove_sh_holes(void) {
+    for (int i=0; i+1 < sh_entries.size(); i++) {
+        auto sh0 = &(sh_entries[i]);
+        elf32_sh_entry sh1 = sh_entries[i+1];
+        if (
+            (sh0->type == SHT_PROGBITS && sh1.type == SHT_PROGBITS)
+            && (sh0->size && sh1.size)
+            && (sh0->addr + sh0->size < sh1.addr)
+            && (segment_from_virtual_address(sh0->addr) == segment_from_virtual_address(sh1.addr))
+        ) {
+            uint32_t gap = sh1.addr - sh0->addr - sh0->size;
+            if (gap > sh1.addralign) {
+                fail(ERROR_INCOMPATIBLE, "Cannot plug gap greater than alignment - gap %d, alignment %d", gap, sh1.addralign);
+            }
+            if (verbose) printf("Section %d: Moving end from 0x%08x to 0x%08x to plug gap\n", i, sh0->addr + sh0->size, sh1.addr);
+            sh0->size = sh1.addr - sh0->addr;
+        }
+    }
+}
+
 // Read the section data from the internal byte array into discrete sections.
 // This is used after modifying segments but before inserting new segments
 void elf_file::read_sh_data(void) {
@@ -271,18 +285,6 @@ void elf_file::read_sh_data(void) {
             read_bytes(sh.offset, sh.size, &sh_data[sh_idx][0]);
         }
         sh_idx++;
-    }
-}
-
-void elf_file::read_ph_data(void) {
-    int ph_idx = 0;
-    ph_data.resize(eh.ph_num);
-    for (const auto &ph: ph_entries) {
-        if (ph.filez) {
-            ph_data[ph_idx].resize(ph.filez);
-            read_bytes(ph.offset, ph.filez, &ph_data[ph_idx][0]);
-        }
-        ph_idx++;
     }
 }
 
@@ -391,9 +393,11 @@ int elf_file::read_file(std::shared_ptr<std::iostream> file) {
         if (!rc) {
             read_ph();
             read_sh();
+
+            // Remove any holes in the ELF file, as these cause issues when signing/hashing/encrypting
+            remove_sh_holes();
         }
         read_sh_data();
-        read_ph_data();
     }
     catch (const std::ios_base::failure &e) {
         std::cerr << "Failed to read elf file" << std::endl;
@@ -440,7 +444,6 @@ void elf_file::content(const elf32_ph_entry &ph, const std::vector<uint8_t> &con
     if (verbose) printf("Update segment content offset %x content size %zx physical size %x\n", ph.offset, content.size(), ph.filez);
     memcpy(&elf_bytes[ph.offset], &content[0], std::min(content.size(), (size_t) ph.filez));
     read_sh_data(); // Extract the sections after modifying the content
-    read_ph_data();
 }
 
 void elf_file::content(const elf32_sh_entry &sh, const std::vector<uint8_t> &content) {
@@ -449,7 +452,6 @@ void elf_file::content(const elf32_sh_entry &sh, const std::vector<uint8_t> &con
     if (verbose) printf("Update section content offset %x content size %zx section size %x\n", sh.offset, content.size(), sh.size);
     memcpy(&elf_bytes[sh.offset], &content[0], std::min(content.size(), (size_t) sh.size));
     read_sh_data();  // Extract the sections after modifying the content
-    read_ph_data();
 }
 
 const elf32_ph_entry* elf_file::segment_from_physical_address(uint32_t paddr) {
@@ -527,7 +529,6 @@ const elf32_ph_entry& elf_file::append_segment(uint32_t vaddr, uint32_t paddr, u
     sh_entries.push_back(sh);
     sh_data.push_back(std::vector<uint8_t>(size));
     ph_entries.back().offset = sh.offset;
-    ph_data.push_back(std::vector<uint8_t>(size));
 
     eh.sh_offset = sh.offset + sh.size;
     eh.sh_num++;
