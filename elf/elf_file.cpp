@@ -263,6 +263,7 @@ void elf_file::remove_sh_holes(void) {
             && (sh0->size && sh1.size)
             && (sh0->addr + sh0->size < sh1.addr)
             && (segment_from_virtual_address(sh0->addr) == segment_from_virtual_address(sh1.addr))
+            && segment_from_virtual_address(sh0->addr) != NULL
         ) {
             uint32_t gap = sh1.addr - sh0->addr - sh0->size;
             if (gap > sh1.addralign) {
