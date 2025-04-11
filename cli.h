@@ -422,7 +422,7 @@ namespace cli {
         template<typename T>
         static std::string parse_string(std::string value, T& out) {
             size_t pos = 0;
-            long lvalue = std::numeric_limits<long>::max();
+            uint64_t lvalue = std::numeric_limits<uint64_t>::max();
             int64_t base = 10;
             if (value.find("0x") == 0) {
                 value = value.substr(2);
