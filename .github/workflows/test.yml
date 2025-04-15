@@ -51,7 +51,7 @@ jobs:
           repository: raspberrypi/pico-sdk
           ref: develop
           path: pico-sdk
-          submodules: ${{ !(!matrix.mbedtls) }}
+          submodules: ${{ matrix.mbedtls && 'recursive' || 'false' }}
 
       - name: Build and Install
         run: |
