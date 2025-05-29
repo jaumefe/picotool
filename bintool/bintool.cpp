@@ -260,6 +260,7 @@ block place_new_block(elf_file *elf, std::unique_ptr<block> &first_block) {
 
     int32_t loop_start_rel = 0;
     uint32_t new_block_addr = 0;
+    std::unique_ptr<block> new_first_block;
     if (!first_block->next_block_rel) {
         set_next_block(elf, first_block, highest_address);
         loop_start_rel = -first_block->next_block_rel;
@@ -267,7 +268,6 @@ block place_new_block(elf_file *elf, std::unique_ptr<block> &first_block) {
     } else {
         DEBUG_LOG("There is already a block loop\n");
         uint32_t next_block_addr = first_block->physical_addr + first_block->next_block_rel;
-        std::unique_ptr<block> new_first_block;
         while (true) {
             auto segment = elf->segment_from_physical_address(next_block_addr);
             if (segment == nullptr) {
@@ -314,10 +314,32 @@ block place_new_block(elf_file *elf, std::unique_ptr<block> &first_block) {
 
     // loop back to first block
     block new_block(new_block_addr, loop_start_rel);
-    // copt the existing block
-    std::copy(first_block->items.begin(),
-              first_block->items.end(),
-              std::back_inserter(new_block.items));
+    // check if last block has an image_def
+    if (new_first_block != nullptr && new_first_block->get_item<image_type_item>() != nullptr) {
+        // copy the last block items
+        std::copy(new_first_block->items.begin(),
+                  new_first_block->items.end(),
+                  std::back_inserter(new_block.items));
+    } else {
+        // copy the first block items
+        std::copy(first_block->items.begin(),
+                  first_block->items.end(),
+                  std::back_inserter(new_block.items));
+    }
+
+    // Delete existing signature and hash as these will be replaced with new ones
+    std::shared_ptr<signature_item> signature = new_block.get_item<signature_item>();
+    if (signature != nullptr) {
+        new_block.items.erase(std::remove(new_block.items.begin(), new_block.items.end(), signature), new_block.items.end());
+    }
+    std::shared_ptr<hash_value_item> hash_value = new_block.get_item<hash_value_item>();
+    if (hash_value != nullptr) {
+        new_block.items.erase(std::remove(new_block.items.begin(), new_block.items.end(), hash_value), new_block.items.end());
+    }
+    std::shared_ptr<hash_def_item> hash_def = new_block.get_item<hash_def_item>();
+    if (hash_def != nullptr) {
+        new_block.items.erase(std::remove(new_block.items.begin(), new_block.items.end(), hash_def), new_block.items.end());
+    }
 
     return new_block;
 }
@@ -404,13 +426,14 @@ block place_new_block(std::vector<uint8_t> &bin, uint32_t storage_addr, std::uni
 
     int32_t loop_start_rel = 0;
     uint32_t new_block_addr = 0;
+    std::unique_ptr<block> new_first_block;
     if (!first_block->next_block_rel) {
         set_next_block(bin, storage_addr, first_block, highest_address);
         loop_start_rel = -first_block->next_block_rel;
         new_block_addr = first_block->physical_addr + first_block->next_block_rel;
     } else {
         DEBUG_LOG("Ooh, there is already a block loop - lets find it's end\n");
-        auto new_first_block = get_last_block(bin, storage_addr, first_block);
+        new_first_block = get_last_block(bin, storage_addr, first_block);
         set_next_block(bin, storage_addr, new_first_block, highest_address);
         new_block_addr = new_first_block->physical_addr + new_first_block->next_block_rel;
         loop_start_rel = first_block->physical_addr - new_block_addr;
@@ -421,10 +444,32 @@ block place_new_block(std::vector<uint8_t> &bin, uint32_t storage_addr, std::uni
 
     // loop back to first block
     block new_block(new_block_addr, loop_start_rel);
-    // copt the existing block
-    std::copy(first_block->items.begin(),
-              first_block->items.end(),
-              std::back_inserter(new_block.items));
+    // check if last block has an image_def
+    if (new_first_block != nullptr && new_first_block->get_item<image_type_item>() != nullptr) {
+        // copy the last block items
+        std::copy(new_first_block->items.begin(),
+                  new_first_block->items.end(),
+                  std::back_inserter(new_block.items));
+    } else {
+        // copy the first block items
+        std::copy(first_block->items.begin(),
+                  first_block->items.end(),
+                  std::back_inserter(new_block.items));
+    }
+
+    // Delete existing signature and hash as these will be replaced with new ones
+    std::shared_ptr<signature_item> signature = new_block.get_item<signature_item>();
+    if (signature != nullptr) {
+        new_block.items.erase(std::remove(new_block.items.begin(), new_block.items.end(), signature), new_block.items.end());
+    }
+    std::shared_ptr<hash_value_item> hash_value = new_block.get_item<hash_value_item>();
+    if (hash_value != nullptr) {
+        new_block.items.erase(std::remove(new_block.items.begin(), new_block.items.end(), hash_value), new_block.items.end());
+    }
+    std::shared_ptr<hash_def_item> hash_def = new_block.get_item<hash_def_item>();
+    if (hash_def != nullptr) {
+        new_block.items.erase(std::remove(new_block.items.begin(), new_block.items.end(), hash_def), new_block.items.end());
+    }
 
     return new_block;
 }
@@ -625,7 +670,7 @@ std::vector<uint8_t> get_lm_hash_data(elf_file *elf, block *new_block, bool clea
             if (data.size() != seg->physical_size()) {
                 fail(ERROR_INCOMPATIBLE, "Elf segment physical size (%" PRIx32 ") does not match data size in file (%zx)", seg->physical_size(), data.size());
             }
-            if (seg->physical_size() && seg->physical_address() < new_block->physical_addr) {
+            if (seg->physical_size()) {
                 std::copy(data.begin(), data.end(), std::back_inserter(to_hash));
                 DEBUG_LOG("HASH %08x + %08x\n", (int)seg->physical_address(), (int)seg->physical_size());
                 entries.push_back(
@@ -855,8 +900,7 @@ void verify_block(std::vector<uint8_t> bin, uint32_t storage_addr, uint32_t runt
 }
 
 
-int encrypt(elf_file *elf, block *new_block, const private_t aes_key, const public_t public_key, const private_t private_key, bool hash_value, bool sign) {
-
+void encrypt_guts(elf_file *elf, block *new_block, const aes_key_t aes_key, std::vector<uint8_t> &iv_data, std::vector<uint8_t> &enc_data) {
     std::vector<uint8_t> to_enc = get_lm_hash_data(elf, new_block);
 
     std::random_device rand{};
@@ -872,12 +916,26 @@ int encrypt(elf_file *elf, block *new_block, const private_t aes_key, const publ
         e = rand();
     }
 
-    std::vector<uint8_t> iv_data(iv.bytes, iv.bytes + sizeof(iv.bytes));
+    iv_data.resize(sizeof(iv.bytes));
+    memcpy(iv_data.data(), iv.bytes, sizeof(iv.bytes));
 
-    std::vector<uint8_t> enc_data;
     enc_data.resize(to_enc.size());
 
     aes256_buffer(to_enc.data(), to_enc.size(), enc_data.data(), &aes_key, &iv);
+}
+
+
+int encrypt(elf_file *elf, block *new_block, const aes_key_t aes_key, const public_t public_key, const private_t private_key, std::vector<uint8_t> iv_salt, bool hash_value, bool sign) {
+
+    std::vector<uint8_t> iv_data;
+    std::vector<uint8_t> enc_data;
+    encrypt_guts(elf, new_block, aes_key, iv_data, enc_data);
+
+    // Salt IV
+    assert(iv_data.size() == iv_salt.size());
+    for (int i=0; i < iv_data.size(); i++) {
+        iv_data[i] ^= iv_salt[i];
+    }
 
     unsigned int i=0;
     for(const auto &seg : sorted_segs(elf)) {
@@ -961,7 +1019,7 @@ int encrypt(elf_file *elf, block *new_block, const private_t aes_key, const publ
 }
 
 
-std::vector<uint8_t> encrypt(std::vector<uint8_t> bin, uint32_t storage_addr, uint32_t runtime_addr, block *new_block, const private_t aes_key, const public_t public_key, const private_t private_key, bool hash_value, bool sign) {
+std::vector<uint8_t> encrypt(std::vector<uint8_t> bin, uint32_t storage_addr, uint32_t runtime_addr, block *new_block, const aes_key_t aes_key, const public_t public_key, const private_t private_key, std::vector<uint8_t> iv_salt, bool hash_value, bool sign) {
     std::random_device rand{};
     assert(rand.max() - rand.min() >= 256);
 
@@ -976,6 +1034,12 @@ std::vector<uint8_t> encrypt(std::vector<uint8_t> bin, uint32_t storage_addr, ui
     }
 
     std::vector<uint8_t> iv_data(iv.bytes, iv.bytes + sizeof(iv.bytes));
+
+    // Salt IV
+    assert(iv_data.size() == iv_salt.size());
+    for (int i=0; i < iv_data.size(); i++) {
+        iv_data[i] ^= iv_salt[i];
+    }
 
     std::vector<uint8_t> enc_data;
     enc_data.resize(bin.size());
