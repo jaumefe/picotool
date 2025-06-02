@@ -147,7 +147,7 @@ void runtime_init_clocks(void) {
 #endif
 
 
-bi_decl(bi_ptr_int32(0, 0, otp_key_page, 30));
+bi_decl(bi_ptr_int32(0, 0, otp_key_page, 29));
 
 // The function lock_key() is called from decrypt() after key initialisation is complete and before decryption begins.
 // That is a suitable point to lock the OTP area where key information is stored.

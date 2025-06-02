@@ -852,7 +852,7 @@ struct encrypt_command : public cmd {
             option("--use-mbedtls").set(settings.encrypt.use_mbedtls) % "Use MbedTLS implementation of embedded bootloader (faster but less secure)" +
             (
                 option("--otp-key-page").set(settings.encrypt.otp_key_page_set) % "Specify the OTP page storing the AES key (IV salt is stored on the next page)" &
-                    integer("page").set(settings.encrypt.otp_key_page) % "OTP page (default 30)"
+                    integer("page").set(settings.encrypt.otp_key_page) % "OTP page (default 29)"
             ).force_expand_help(true) +
             (
                 option("--hash").set(settings.seal.hash) % "Hash the encrypted file" +

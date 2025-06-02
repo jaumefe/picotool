@@ -665,7 +665,7 @@ OPTIONS:
         --otp-key-page
             Specify the OTP page storing the AES key (IV salt is stored on the next page)
         <page>
-            OTP page (default 30)
+            OTP page (default 29)
         <aes_key>
             AES Key Share or AES Key
         <iv_salt>
