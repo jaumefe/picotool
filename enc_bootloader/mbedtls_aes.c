@@ -69,6 +69,5 @@ void decrypt(uint8_t* key4way, uint8_t* IV_OTPsalt, uint8_t* IV_public, uint8_t(
 
     uint8_t xor_working_block[16] = {0};
     uint8_t stream_block[16] = {0};
-    size_t nc_off = 0;
     mb_aes_crypt_ctr_xor(&aes, len, (uint8_t*)iv, xor_working_block, stream_block, (uint8_t*)buf, (uint8_t*)buf);
 }
