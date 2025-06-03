@@ -192,6 +192,21 @@ std::unique_ptr<block> find_first_block(std::vector<uint8_t> bin, uint32_t stora
 }
 
 
+void set_block_ignored(elf_file *elf, uint32_t block_addr) {
+    auto seg = elf->segment_from_physical_address(block_addr);
+    if (seg == nullptr) {
+        fail(ERROR_NOT_POSSIBLE, "The ELF file does not contain the block address %x", block_addr);
+    }
+    std::vector<uint8_t> content = elf->content(*seg);
+    uint32_t offset = block_addr + 4 - seg->physical_address();
+    if ((content[offset] & 0x7f) != PICOBIN_BLOCK_ITEM_PARTITION_TABLE) {
+        DEBUG_LOG("setting block at %08x to ignored\n", block_addr);
+        content[offset] = 0x7e;   
+    }
+    elf->content(*seg, content);
+}
+
+
 void set_next_block(elf_file *elf, std::unique_ptr<block> &first_block, uint32_t highest_address) {
     // todo this isn't right, but virtual should be physical for now
     auto seg = elf->segment_from_physical_address(first_block->physical_addr);
@@ -214,6 +229,15 @@ void set_next_block(elf_file *elf, std::unique_ptr<block> &first_block, uint32_t
 }
 
 
+void set_block_ignored(std::vector<uint8_t> &bin, uint32_t storage_addr, uint32_t block_addr) {
+    uint32_t offset = block_addr + 4 - storage_addr;
+    if ((bin[offset] & 0x7f) != PICOBIN_BLOCK_ITEM_PARTITION_TABLE) {
+        DEBUG_LOG("setting block at %08x to ignored\n", block_addr);
+        bin[offset] = 0x7e;   
+    }
+}
+
+
 void set_next_block(std::vector<uint8_t> &bin, uint32_t storage_addr, std::unique_ptr<block> &first_block, uint32_t highest_address) {
     // todo this isn't right, but virtual should be physical for now
     uint32_t offset = first_block->physical_addr + first_block->next_block_rel_index * 4 - storage_addr;
@@ -230,7 +254,7 @@ void set_next_block(std::vector<uint8_t> &bin, uint32_t storage_addr, std::uniqu
 }
 
 
-block place_new_block(elf_file *elf, std::unique_ptr<block> &first_block) {
+block place_new_block(elf_file *elf, std::unique_ptr<block> &first_block, bool set_others_ignored) {
     uint32_t highest_ram_address = 0;
     uint32_t highest_flash_address = 0;
     bool no_flash = false;
@@ -265,8 +289,10 @@ block place_new_block(elf_file *elf, std::unique_ptr<block> &first_block) {
         set_next_block(elf, first_block, highest_address);
         loop_start_rel = -first_block->next_block_rel;
         new_block_addr = first_block->physical_addr + first_block->next_block_rel;
+        if (set_others_ignored) set_block_ignored(elf, first_block->physical_addr);
     } else {
         DEBUG_LOG("There is already a block loop\n");
+        if (set_others_ignored) set_block_ignored(elf, first_block->physical_addr);
         uint32_t next_block_addr = first_block->physical_addr + first_block->next_block_rel;
         while (true) {
             auto segment = elf->segment_from_physical_address(next_block_addr);
@@ -300,6 +326,7 @@ block place_new_block(elf_file *elf, std::unique_ptr<block> &first_block) {
                 break;
             } else {
                 DEBUG_LOG("Continue looping\n");
+                if (set_others_ignored) set_block_ignored(elf, new_first_block->physical_addr);
                 next_block_addr = new_first_block->physical_addr + new_first_block->next_block_rel;
                 new_first_block.reset();
             }
@@ -399,7 +426,7 @@ std::unique_ptr<block> get_last_block(std::vector<uint8_t> &bin, uint32_t storag
 }
 
 
-block place_new_block(std::vector<uint8_t> &bin, uint32_t storage_addr, std::unique_ptr<block> &first_block) {
+block place_new_block(std::vector<uint8_t> &bin, uint32_t storage_addr, std::unique_ptr<block> &first_block, bool set_others_ignored) {
     uint32_t highest_ram_address = 0;
     uint32_t highest_flash_address = 0;
     bool no_flash = false;
@@ -431,9 +458,14 @@ block place_new_block(std::vector<uint8_t> &bin, uint32_t storage_addr, std::uni
         set_next_block(bin, storage_addr, first_block, highest_address);
         loop_start_rel = -first_block->next_block_rel;
         new_block_addr = first_block->physical_addr + first_block->next_block_rel;
+        if (set_others_ignored) set_block_ignored(bin, storage_addr, first_block->physical_addr);
     } else {
         DEBUG_LOG("Ooh, there is already a block loop - lets find it's end\n");
-        new_first_block = get_last_block(bin, storage_addr, first_block);
+        auto all_blocks = get_all_blocks(bin, storage_addr, first_block);
+        for (auto &block : all_blocks) {
+            if (set_others_ignored) set_block_ignored(bin, storage_addr, block->physical_addr);
+        }
+        new_first_block = std::move(all_blocks.back());
         set_next_block(bin, storage_addr, new_first_block, highest_address);
         new_block_addr = new_first_block->physical_addr + new_first_block->next_block_rel;
         loop_start_rel = first_block->physical_addr - new_block_addr;
