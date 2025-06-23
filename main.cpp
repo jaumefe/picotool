@@ -114,6 +114,10 @@ static const string rp2350_arm_s_family_name = "rp2350-arm-s";
 static const string rp2350_arm_ns_family_name = "rp2350-arm-ns";
 static const string rp2350_riscv_family_name = "rp2350-riscv";
 
+#if !HAS_LIBUSB
+static const string built_without_libusb_message = "\nThis version of picotool was compiled without USB support. Some commands are not available.\n";
+#endif
+
 static string hex_string(int64_t value, int width=8, bool prefix=true, bool uppercase=false) {
     std::stringstream ss;
     if (prefix) ss << "0x";
@@ -705,7 +709,11 @@ struct info_command : public cmd {
     }
 
     string get_doc() const override {
+        #if HAS_LIBUSB
         return "Display information from the target device(s) or file.\nWithout any arguments, this will display basic information for all connected RP-series devices in BOOTSEL mode";
+        #else
+        return "Display information from the target file.";
+        #endif
     }
 };
 
@@ -736,7 +744,11 @@ struct config_command : public cmd {
     }
 
     string get_doc() const override {
+        #if HAS_LIBUSB
         return "Display or change program configuration settings from the target device(s) or file.";
+        #else
+        return "Display or change program configuration settings from the target file.";
+        #endif
     }
 };
 
@@ -1376,8 +1388,12 @@ struct version_command : public cmd {
     bool execute(device_map &devices) override {
         if (settings.version.semantic)
             std::cout << PICOTOOL_VERSION << "\n";
-        else
+        else {
             std::cout << "picotool v" << PICOTOOL_VERSION << " (" << SYSTEM_VERSION << ", " << COMPILER_INFO << ")\n";
+            #if !HAS_LIBUSB
+            std::cout << built_without_libusb_message;
+            #endif
+        }
         if (!settings.version.version.empty()) {
             string picotool_v = string(PICOTOOL_VERSION);
             picotool_v = picotool_v.substr(0, picotool_v.find("-"));
@@ -1623,6 +1639,9 @@ int parse(const int argc, char **argv) {
             } else {
                 fos << string("Use \"picotool help ").append(selected_cmd->name()).append("\" for more info\n");
             }
+            #if !HAS_LIBUSB
+            fos << built_without_libusb_message;
+            #endif
         } else {
             cli::option_map options;
             selected_cmd->get_cli().get_option_help("", "", options);
@@ -1654,6 +1673,11 @@ int parse(const int argc, char **argv) {
             fos.hanging_indent(0);
             fos.wrap_hard();
             fos << "Use \"picotool help <cmd>\" for more info\n";
+            #if !HAS_LIBUSB
+            if (!help_mode) {
+                fos << built_without_libusb_message;
+            }
+            #endif
         }
         fos.flush();
     };
