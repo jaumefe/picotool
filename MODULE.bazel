@@ -1,6 +1,6 @@
 module(
     name = "picotool",
-    version = "2.1.2-develop",
+    version = "2.2.0",
 )
 
 bazel_dep(name = "rules_libusb", version = "0.1.0-rc2")
