@@ -18,6 +18,12 @@ Use your favorite package tool to install dependencies. For example, on Ubuntu:
 sudo apt install build-essential pkg-config libusb-1.0-0-dev cmake
 ```
 
+##### Alternative to install dependencies with nix
+
+Instead of having to manually install every dependency, it can be managed through [Nix](https://nixos.org/download/) / [Lix](https://lix.systems/install/).
+
+Before building the project, just use the following command: `nix develop`
+
 Then simply build like a normal CMake project:
 
 ```console
