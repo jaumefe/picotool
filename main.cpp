@@ -14,6 +14,7 @@
 #include <csignal>
 #include <cstdio>
 #include <regex>
+#include <random>
 #if !defined(__APPLE__) && !defined(__FreeBSD__)
 #include <cuchar>
 #endif
@@ -33,10 +34,10 @@
 
 #include "boot/uf2.h"
 #include "boot/picobin.h"
+#include "get_enc_bootloader.h"
 #if HAS_LIBUSB
     #include "picoboot_connection_cxx.h"
-    #include "rp2350.rom.h"
-    #include "xip_ram_perms.h"
+    #include "get_xip_ram_perms.h"
 #else
     #include "picoboot_connection.h"
 #endif
@@ -47,6 +48,7 @@
 #include "pico/stdio_usb/reset_interface.h"
 #include "elf.h"
 #include "otp.h"
+#include "model.h"
 #include "errors.h"
 #include "hardware/regs/otp_data.h"
 
@@ -80,6 +82,19 @@ static __forceinline int __builtin_ctz(unsigned x) {
 #define OTP_PAGE_COUNT 64
 #define OTP_PAGE_ROWS  64
 #define OTP_ROW_COUNT (OTP_PAGE_COUNT * OTP_PAGE_ROWS)
+#define OTP_SPECIAL_PAGES 3
+
+// Support for SDK 2.1.0 & SDK 2.1.1 -----
+#ifndef CYW43_FIRMWARE_FAMILY_ID
+#define CYW43_FIRMWARE_FAMILY_ID    0xe48bff55u
+#endif
+#ifndef BOOTROM_FAMILY_ID_MIN
+#define BOOTROM_FAMILY_ID_MIN       RP2040_FAMILY_ID
+#endif
+#ifndef BOOTROM_FAMILY_ID_MAX
+#define BOOTROM_FAMILY_ID_MAX       RP2350_ARM_NS_FAMILY_ID
+#endif
+// ------
 
 using std::string;
 using std::vector;
@@ -90,9 +105,9 @@ using std::ios;
 using json = nlohmann::json;
 
 #if HAS_LIBUSB
-typedef map<enum picoboot_device_result,vector<tuple<model_t, libusb_device *, libusb_device_handle *>>> device_map;
+typedef map<enum picoboot_device_result,vector<tuple<chip_t, libusb_device *, libusb_device_handle *>>> device_map;
 #else
-typedef map<enum picoboot_device_result,vector<tuple<model_t, void *, void *>>> device_map;
+typedef map<enum picoboot_device_result,vector<tuple<chip_t, void *, void *>>> device_map;
 #endif
 
 auto memory_names = map<enum memory_type, string>{
@@ -110,6 +125,11 @@ static const string rp2040_family_name = "rp2040";
 static const string rp2350_arm_s_family_name = "rp2350-arm-s";
 static const string rp2350_arm_ns_family_name = "rp2350-arm-ns";
 static const string rp2350_riscv_family_name = "rp2350-riscv";
+static const string cyw43_firmware_family_name = "cyw43-firmware";
+
+#if !HAS_LIBUSB
+static const string built_without_libusb_message = "\nThis version of picotool was compiled without USB support. Some commands are not available.\n";
+#endif
 
 static string hex_string(int64_t value, int width=8, bool prefix=true, bool uppercase=false) {
     std::stringstream ss;
@@ -151,15 +171,9 @@ std::array<std::array<string, 48>, 12> pin_functions_rp2350{{
 std::map<uint32_t, otp_reg> otp_regs;
 
 #if HAS_LIBUSB
-auto bus_device_string = [](struct libusb_device *device, model_t model) {
+auto bus_device_string = [](struct libusb_device *device, chip_t chip) {
     string bus_device;
-    if (model == rp2040) {
-        bus_device = string("RP2040 device at bus ");
-    } else if (model == rp2350) {
-        bus_device = string("RP2350 device at bus ");
-    } else {
-        bus_device = string("Device at bus ");
-    }
+    bus_device = chip_name(chip) + string(" device at bus ");
     return bus_device + std::to_string(libusb_get_bus_number(device)) + ", address " + std::to_string(libusb_get_device_address(device));
 };
 #endif
@@ -181,9 +195,11 @@ const string getFiletypeName(enum filetype type)
 struct cancelled_exception : std::exception { };
 
 struct not_mapped_exception : std::exception {
+    explicit not_mapped_exception(uint32_t addr) : addr(addr), std::exception() {}
     const char *what() const noexcept override {
         return "Hmm uncaught not mapped";
     }
+    uint32_t addr;
 };
 
 // from -> to
@@ -245,18 +261,53 @@ template <typename T> struct range_map {
         }
     }
 
+    void insert_overwrite(const range& r, T t) {
+        if (r.to != r.from) {
+            assert(r.to > r.from);
+            // insert overlapping entry, and overwrite any it overlaps
+
+            // avoid modifying m while iterating through it
+            vector<uint32_t> to_erase;
+            vector<pair<uint32_t, pair<uint32_t, T>>> to_add;
+
+            auto f = m.upper_bound(r.from); // first element that starts after r.from
+            if (f != m.begin()) f--; // back up, to catch element that starts on or before r.from
+            for(; f != m.end() && f->first < r.to; f++) { // loop till we can't possibly overlap
+                range r2(f->first, f->second.first);
+                T r2off = f->second.second;
+                if (r2.intersects(r)) {
+                    // remove existing r2
+                    to_erase.push_back(r2.from);
+                    if (r2.from < r.from) {
+                        // add r2 which ends at start of r
+                        to_add.push_back(std::make_pair(r2.from, std::make_pair(r.from, r2off)));
+                    }
+                    if (r2.to > r.to) {
+                        // add r2 which starts at end of r
+                        to_add.push_back(std::make_pair(r.to, std::make_pair(r2.to, r2off + (r.to - r2.from))));
+                    }
+                }
+            }
+            for (auto k : to_erase) m.erase(k);
+            for (auto v : to_add) m.insert(v);
+
+            // finally, add the new entry
+            m.insert(std::make_pair(r.from, std::make_pair(r.to, t)));
+        }
+    }
+
     pair<mapping, T> get(uint32_t p) {
         auto f = m.upper_bound(p);
         if (f == m.end()) {
             if (m.empty())
-                throw not_mapped_exception();
+                throw not_mapped_exception(p);
         } else if (f == m.begin()) {
-            throw not_mapped_exception();
+            throw not_mapped_exception(p);
         }
         f--;
         assert(p >= f->first);
         if (p >= f->second.first) {
-            throw not_mapped_exception();
+            throw not_mapped_exception(p);
         }
         return std::make_pair(mapping(p - f->first, f->second.first - f->first), f->second.second);
     }
@@ -291,6 +342,14 @@ private:
     map<uint32_t, pair<uint32_t, T>> m;
 };
 
+
+// Calculate chunk size for load/save/verify
+// Returns size/100 rounded up to FLASH_SECTOR_ERASE_SIZE
+uint32_t calculate_chunk_size(uint32_t size) {
+    return (((size + (100 - 1))/100 + FLASH_SECTOR_ERASE_SIZE - 1) & ~(FLASH_SECTOR_ERASE_SIZE - 1));
+}
+
+
 using cli::group;
 using cli::option;
 using cli::integer;
@@ -315,10 +374,12 @@ struct family_id : public cli::value_base<family_id> {
                 t = RP2040_FAMILY_ID;
             } else if (value == rp2350_arm_s_family_name) {
                 t = RP2350_ARM_S_FAMILY_ID;
-            } else if (value == rp2350_arm_s_family_name) {
+            } else if (value == rp2350_arm_ns_family_name) {
                 t = RP2350_ARM_NS_FAMILY_ID;
             } else if (value == rp2350_riscv_family_name) {
                 t = RP2350_RISCV_FAMILY_ID;
+            } else if (value == cyw43_firmware_family_name) {
+                t = CYW43_FIRMWARE_FAMILY_ID;
             } else {
                 if (value.find("0x") == 0) {
                     value = value.substr(2);
@@ -354,9 +415,32 @@ string family_name(unsigned int family_id) {
     if (family_id == RP2350_ARM_S_FAMILY_ID) return "'" + rp2350_arm_s_family_name + "'";
     if (family_id == RP2350_ARM_NS_FAMILY_ID) return "'" + rp2350_arm_ns_family_name + "'";
     if (family_id == RP2350_RISCV_FAMILY_ID) return "'" + rp2350_riscv_family_name + "'";
+    if (family_id == CYW43_FIRMWARE_FAMILY_ID) return "'" + cyw43_firmware_family_name + "'";
     if (!family_id) return "none";
     return hex_string(family_id);
 }
+
+struct platform_model : public cli::value_base<platform_model> {
+    explicit platform_model(string name) : value_base(std::move(name)) {}
+
+    template<typename T>
+    platform_model &set(T &t) {
+        string nm = "<" + name() + ">";
+        // note we cannot capture "this"
+        on_action([&t, nm](string value) {
+            auto ovalue = value;
+            if (value == "rp2040") {
+                t = std::make_shared<model_rp2040>();
+            } else if (value == "rp2350") {
+                t = std::make_shared<model_rp2350>();
+            } else {
+                return value + " is not a valid platform";
+            }
+            return string("");
+        });
+        return *this;
+    }
+};
 
 struct cmd {
     explicit cmd(string name) : _name(std::move(name)) {}
@@ -389,8 +473,8 @@ private:
 };
 
 struct _settings {
-    std::array<std::string, 4> filenames;
-    std::array<std::string, 4> file_types;
+    std::array<std::string, 6> filenames;
+    std::array<std::string, 6> file_types;
     uint32_t binary_start = FLASH_START;
     int bus=-1;
     int address=-1;
@@ -410,8 +494,10 @@ struct _settings {
     bool force_no_reboot = false;
     string switch_cpu;
     uint32_t family_id = 0;
+    model_t model = nullptr;
     bool quiet = false;
     bool verbose = false;
+    bool use_flash_cache = false;
 
     struct {
         int redundancy = -1;
@@ -430,6 +516,7 @@ struct _settings {
         std::vector<std::string> selectors;
         uint32_t row = 0;
         std::vector<std::string> extra_files;
+        bool dump_pages = false;
     } otp;
 
     struct {
@@ -462,11 +549,20 @@ struct _settings {
         bool hash = false;
         bool sign = false;
         bool clear_sram = false;
+        bool set_tbyb = false;
         uint16_t major_version = 0;
         uint16_t minor_version = 0;
         uint16_t rollback_version = 0;
         std::vector<uint16_t> rollback_rows;
     } seal;
+
+    struct {
+        bool embed = false;
+        bool otp_key_page_set = false;
+        bool fast_rosc = false;
+        bool use_mbedtls = false;
+        uint16_t otp_key_page = 29;
+    } encrypt;
 
     struct {
         uint32_t align = 0x1000;
@@ -494,7 +590,7 @@ struct _settings {
 
     struct {
         bool abs_block = false;
-        #if SUPPORT_A2
+        #if SUPPORT_RP2350_A2
         uint32_t abs_block_loc = 0x11000000 - UF2_PAGE_SIZE;
         #else
         uint32_t abs_block_loc = 0;
@@ -503,7 +599,7 @@ struct _settings {
 };
 _settings settings;
 std::shared_ptr<cmd> selected_cmd;
-model_t selected_model = unknown;
+chip_t selected_chip = unknown;
 
 auto device_selection =
     (
@@ -515,7 +611,7 @@ auto device_selection =
         (option("--pid") & integer("pid").set(settings.pid)) % "Filter by product id" +
         (option("--ser") & value("ser").set(settings.ser)) % "Filter by serial number"
         + option('f', "--force").set(settings.force) % "Force a device not in BOOTSEL mode but running compatible code to reset so the command can be executed. After executing the command (unless the command itself is a 'reboot') the device will be rebooted back to application mode" +
-                option('F', "--force-no-reboot").set(settings.force_no_reboot) % "Force a device not in BOOTSEL mode but running compatible code to reset so the command can be executed. After executing the command (unless the command itself is a 'reboot') the device will be left connected and accessible to picotool, but without the RPI-RP2 drive mounted"
+                option('F', "--force-no-reboot").set(settings.force_no_reboot) % "Force a device not in BOOTSEL mode but running compatible code to reset so the command can be executed. After executing the command (unless the command itself is a 'reboot') the device will be left connected and accessible to picotool, but without the USB drive mounted"
     ).min(0).doc_non_optional(true).collapse_synopsys("device-selection");
 
 #define file_types_x(i)\
@@ -551,6 +647,13 @@ auto device_selection =
     named_file_types_x(types, i)\
 )
 
+#define named_untyped_file_selection_x(name, i)\
+(\
+    value(name).with_exclusion_filter([](const string &value) {\
+            return value.find_first_of('-') == 0;\
+        }).set(settings.filenames[i]) % "The file name"\
+)
+
 #define optional_file_selection_x(name, i)\
 (\
     value(name).with_exclusion_filter([](const string &value) {\
@@ -567,12 +670,34 @@ auto device_selection =
     named_file_types_x(types, i)\
 ).min(0).doc_non_optional(true)
 
+#define optional_untyped_file_selection_x(name, i)\
+(\
+    value(name).with_exclusion_filter([](const string &value) {\
+            return value.find_first_of('-') == 0;\
+        }).set(settings.filenames[i]).min(0) % "The file name"\
+).min(0).doc_non_optional(true)
+
 #define option_file_selection_x(option, i)\
 (\
     option & value("filename").with_exclusion_filter([](const string &value) {\
             return value.find_first_of('-') == 0;\
         }).set(settings.filenames[i]) % "The file name" +\
     file_types_x(i)\
+)
+
+#define option_typed_file_selection_x(option, i, types)\
+(\
+    option & value("filename").with_exclusion_filter([](const string &value) {\
+            return value.find_first_of('-') == 0;\
+        }).set(settings.filenames[i]) % "The file name" +\
+    named_file_types_x(types, i)\
+)
+
+#define option_untyped_file_selection_x(option, i)\
+(\
+    option & value("filename").with_exclusion_filter([](const string &value) {\
+            return value.find_first_of('-') == 0;\
+        }).set(settings.filenames[i]) % "The file name"\
 )
 
 auto file_types = (option ('t', "--type") & value("type").set(settings.file_types[0]))
@@ -617,7 +742,11 @@ struct info_command : public cmd {
     }
 
     string get_doc() const override {
+        #if HAS_LIBUSB
         return "Display information from the target device(s) or file.\nWithout any arguments, this will display basic information for all connected RP-series devices in BOOTSEL mode";
+        #else
+        return "Display information from the target file.";
+        #endif
     }
 };
 
@@ -648,7 +777,11 @@ struct config_command : public cmd {
     }
 
     string get_doc() const override {
+        #if HAS_LIBUSB
         return "Display or change program configuration settings from the target device(s) or file.";
+        #else
+        return "Display or change program configuration settings from the target file.";
+        #endif
     }
 };
 
@@ -659,7 +792,6 @@ struct verify_command : public cmd {
 
     group get_cli() override {
         return (
-            device_selection % "Target device selection" +
             file_selection % "The file to compare against" +
             (
                 (option('r', "--range").set(settings.range_set) % "Compare a sub range of memory only" &
@@ -667,7 +799,8 @@ struct verify_command : public cmd {
                     hex("to").set(settings.to) % "The upper address bound in hex").force_expand_help(true) +
                 (option('o', "--offset").set(settings.offset_set) % "Specify the load address when comparing with a BIN file" &
                     hex("offset").set(settings.offset) % "Load offset (memory address; default 0x10000000)").force_expand_help(true)
-           ).min(0).doc_non_optional(true) % "Address options"
+            ).min(0).doc_non_optional(true) % "Address options" +
+            device_selection % "Target device selection"
         );
     }
 
@@ -695,8 +828,8 @@ struct save_command : public cmd {
             (option("--family") % "Specify the family ID to save the file as" &
                 family_id("family_id").set(settings.family_id) % "family ID to save file as").force_expand_help(true) +
             ( // note this parenthesis seems to help with error messages for say save --foo
-                device_selection % "Source device selection" +
-                file_selection % "File to save to"
+                file_selection % "File to save to" +
+                device_selection % "Source device selection"
             )
         );
     }
@@ -776,6 +909,13 @@ struct encrypt_command : public cmd {
         return (
             option("--quiet").set(settings.quiet) % "Don't print any output" +
             option("--verbose").set(settings.verbose) % "Print verbose output" +
+            option("--embed").set(settings.encrypt.embed) % "Embed bootloader in output file" +
+            option("--fast-rosc").set(settings.encrypt.fast_rosc) % "Use ~180MHz ROSC configuration for embedded bootloader" +
+            option("--use-mbedtls").set(settings.encrypt.use_mbedtls) % "Use MbedTLS implementation of embedded bootloader (faster but less secure)" +
+            (
+                option("--otp-key-page").set(settings.encrypt.otp_key_page_set) % "Specify the OTP page storing the AES key (IV salt is stored on the next page)" &
+                    integer("page").set(settings.encrypt.otp_key_page) % "OTP page (default 29)"
+            ).force_expand_help(true) +
             (
                 option("--hash").set(settings.seal.hash) % "Hash the encrypted file" +
                 option("--sign").set(settings.seal.sign) % "Sign the encrypted file"
@@ -786,8 +926,10 @@ struct encrypt_command : public cmd {
                      hex("offset").set(settings.offset) % "Load offset (memory address; default 0x10000000)"
             ).force_expand_help(true) % "BIN file options" +
             named_file_selection_x("outfile", 1) % "File to save to" +
-            named_typed_file_selection_x("aes_key", 2, "bin") % "AES Key" +
-            optional_typed_file_selection_x("signing_key", 3, "pem") % "Signing Key file"
+            named_untyped_file_selection_x("aes_key", 2) % "AES Key Share or AES Key" +
+            named_untyped_file_selection_x("iv_salt", 3) % "IV Salt" +
+            optional_untyped_file_selection_x("signing_key", 4) % "Signing Key file (.pem)" +
+            optional_untyped_file_selection_x("otp", 5) % "JSON file to save OTP to (will edit existing file if it exists)"
         );
     }
 
@@ -816,8 +958,8 @@ struct seal_command : public cmd {
                      hex("offset").set(settings.offset) % "Load offset (memory address; default 0x10000000)"
             ).force_expand_help(true) % "BIN file options" +
             named_file_selection_x("outfile", 1) % "File to save to" +
-            optional_typed_file_selection_x("key", 2, "pem") % "Key file" +
-            optional_typed_file_selection_x("otp", 3, "json") % "File to save OTP to (will edit existing file if it exists)" + 
+            optional_untyped_file_selection_x("key", 2) % "Key file (.pem)" +
+            optional_untyped_file_selection_x("otp", 3) % "JSON file to save OTP to (will edit existing file if it exists)" +
             (
                 option("--major") &
                     integer("major").set(settings.seal.major_version)
@@ -853,7 +995,7 @@ struct link_command : public cmd {
             named_file_selection_x("infile1", 1) % "Files to link" +
             named_file_selection_x("infile2", 2) % "Files to link" +
             optional_file_selection_x("infile3", 3) % "Files to link" +
-            option('p', "--pad") & hex("pad").set(settings.link.align) % "Specify alignment to pad to, defaults to 0x1000"
+            (option('p', "--pad") & hex("pad").set(settings.link.align)) % "Specify alignment to pad to, defaults to 0x1000"
         );
     }
 
@@ -889,7 +1031,7 @@ struct partition_create_command : public cmd {
         return (
                 option("--quiet").set(settings.quiet) % "Don't print any output" +
                 option("--verbose").set(settings.verbose) % "Print verbose output" +
-                named_typed_file_selection_x("infile", 0, "json") % "partition table JSON" +
+                named_untyped_file_selection_x("infile", 0) % "partition table JSON" +
                 (named_file_selection_x("outfile", 1) % "output file" +
                 (
                     (option('o', "--offset").set(settings.offset_set) % "Specify the load address for UF2 file output" &
@@ -909,7 +1051,7 @@ struct partition_create_command : public cmd {
                 #endif
                     (option("--singleton").set(settings.partition.singleton) % "Singleton partition table")
                 ).min(0).force_expand_help(true) % "Partition Table Options"
-            #if SUPPORT_A2
+            #if SUPPORT_RP2350_A2
                 + (
                     option("--abs-block").set(settings.uf2.abs_block) % "Enforce support for an absolute block" +
                         hex("abs_block_loc").set(settings.uf2.abs_block_loc).min(0) % "absolute block location (default to 0x10ffff00)"
@@ -956,12 +1098,12 @@ struct otp_list_command : public cmd {
                         "ROW_NAME to select a whole row by name.\n" \
                         "ROW_NUMBER to select a whole row by number.\n" \
                         "PAGE:PAGE_ROW_NUMBER to select a whole row by page and number within page.\n\n" \
-                        "... or can select a single field/subset of a row (where REG_SEL is one of the above row selectors):\n\n"
-                         "REG_SEL.FIELD_NAME to select a field within a row by name.\n" \
-                        "REG_SEL.n-m to select a range of bits within a row.\n" \
-                        "REG_SEL.n to select a single bit within a row.\n" \
+                        "... or can select a single field/subset of a row (where ROW_SEL is one of the above row selectors):\n\n"
+                         "ROW_SEL.FIELD_NAME to select a field within a row by name.\n" \
+                        "ROW_SEL.n-m to select a range of bits within a row.\n" \
+                        "ROW_SEL.n to select a single bit within a row.\n" \
                         ".FIELD_NAME to select any row's field by name.\n\n" \
-                        ".. or can selected multiple rows by using blank or '*' for PAGE or PAGE_ROW_NUMBER").repeatable().min(0)
+                        ".. or can select multiple rows by using blank or '*' for PAGE or PAGE_ROW_NUMBER").repeatable().min(0)
                 ) % "Row/Field Selection"
         );
     }
@@ -980,7 +1122,7 @@ struct otp_get_command : public cmd {
         return (
                 (
                         (option('c', "--copies") & integer("copies").min(1).set(settings.otp.redundancy)) % "Read multiple redundant values" +
-                        option('r', "--raw").set(settings.otp.raw) % "Get raw 24 bit values" +
+                        option('r', "--raw").set(settings.otp.raw) % "Get raw 24-bit values" +
                         option('e', "--ecc").set(settings.otp.ecc) % "Use error correction" +
                         option('n', "--no-descriptions").set(settings.otp.list_no_descriptions) % "Don't show descriptions" +
                         (option('i', "--include") & value("filename").add_to(settings.otp.extra_files)).min(0).max(1) % "Include extra otp definition" // todo more than 1
@@ -995,12 +1137,12 @@ struct otp_get_command : public cmd {
                         "ROW_NAME to select a whole row by name.\n" \
                         "ROW_NUMBER to select a whole row by number.\n" \
                         "PAGE:PAGE_ROW_NUMBER to select a whole row by page and number within page.\n\n" \
-                        "... or can select a single field/subset of a row (where REG_SEL is one of the above row selectors):\n\n"
-                         "REG_SEL.FIELD_NAME to select a field within a row by name.\n" \
-                        "REG_SEL.n-m to select a range of bits within a row.\n" \
-                        "REG_SEL.n to select a single bit within a row.\n" \
+                        "... or can select a single field/subset of a row (where ROW_SEL is one of the above row selectors):\n\n"
+                         "ROW_SEL.FIELD_NAME to select a field within a row by name.\n" \
+                        "ROW_SEL.n-m to select a range of bits within a row.\n" \
+                        "ROW_SEL.n to select a single bit within a row.\n" \
                         ".FIELD_NAME to select any row's field by name.\n\n" \
-                        ".. or can selected multiple rows by using blank or '*' for PAGE or PAGE_ROW_NUMBER").repeatable().min(0)
+                        ".. or can select multiple rows by using blank or '*' for PAGE or PAGE_ROW_NUMBER").repeatable().min(0)
                 ) % "Row/Field Selection"
         );
     }
@@ -1015,15 +1157,24 @@ struct otp_dump_command : public cmd {
     otp_dump_command() : cmd("dump") {}
     bool execute(device_map& devices) override;
     virtual bool requires_rp2350() const override { return true; }
+    device_support get_device_support() override {
+        if (settings.filenames[0].empty())
+            return one;
+        else
+            return none;
+    }
 
     group get_cli() override {
         return (
                 (
-                        option('r', "--raw").set(settings.otp.raw) % "Get raw 24 bit values" +
-                        option('e', "--ecc").set(settings.otp.ecc) % "Use error correction"
+                        option('r', "--raw").set(settings.otp.raw) % "Get raw 24-bit values. This is the default" +
+                        option('e', "--ecc").set(settings.otp.ecc) % "Use error correction" +
+                        option('p', "--pages").set(settings.otp.dump_pages) % "Index by page number & row number" +
+                        option_untyped_file_selection_x(option("--output"), 1) % "Output BIN file to dump to (optional)"
                 ).min(0).doc_non_optional(true) % "Row/field options" +
                 (
-                        device_selection % "Target device selection"
+                        device_selection % "To dump the contents of a target device" |
+                        named_typed_file_selection_x("input", 0, "json") % "To dump the contents of an OTP JSON file"
                 ).major_group("TARGET SELECTION").min(0).doc_non_optional(true)
         );
     }
@@ -1041,7 +1192,7 @@ struct otp_load_command : public cmd {
     group get_cli() override {
         return (
                 (
-                        option('r', "--raw").set(settings.otp.raw) % "Get raw 24 bit values" +
+                        option('r', "--raw").set(settings.otp.raw) % "Set raw 24-bit values. This is the default for BIN files" +
                         option('e', "--ecc").set(settings.otp.ecc) % "Use error correction" +
                         (option('s', "--start_row") & integer("row").set(settings.otp.row)) % "Start row to load at (note use 0x for hex)" +
                         (option('i', "--include") & value("filename").add_to(settings.otp.extra_files)).min(0).max(1) % "Include extra otp definition" // todo more than 1
@@ -1052,7 +1203,7 @@ struct otp_load_command : public cmd {
     }
 
     string get_doc() const override {
-        return "Load the row range stored in a file into OTP and verify. Data is 2 bytes/row for ECC, 4 bytes/row for raw.";
+        return "Load the row range stored in a file into OTP and verify. Data is 2 bytes/row for ECC, 4 bytes/row for raw (MSB is ignored).";
     }
 };
 
@@ -1065,8 +1216,8 @@ struct otp_set_command : public cmd {
     group get_cli() override {
         return (
                 (
-                        (option('c', "--copies") & integer("copies").min(1).set(settings.otp.redundancy)) % "Read multiple redundant values" +
-                        option('r', "--raw").set(settings.otp.raw) % "Set raw 24 bit values" +
+                        (option('c', "--copies") & integer("copies").min(1).set(settings.otp.redundancy)) % "Write multiple redundant values" +
+                        option('r', "--raw").set(settings.otp.raw) % "Set raw 24-bit values" +
                         option('e', "--ecc").set(settings.otp.ecc) % "Use error correction" +
                         option('s', "--set-bits").set(settings.otp.ignore_set) % "Set bits only" +
                         (option('i', "--include") & value("filename").add_to(settings.otp.extra_files)).min(0).max(1) % "Include extra otp definition" // todo more than 1
@@ -1074,10 +1225,15 @@ struct otp_set_command : public cmd {
                 (
                         option('z', "--fuzzy").set(settings.otp.fuzzy) % "Allow fuzzy name searches in selector vs exact match" +
                         (value("selector").add_to(settings.otp.selectors) %
-                        "The row/field selector, which can be:\nROW_NAME or ROW_NUMBER or PAGE:PAGE_ROW_NUMBER to select a whole row.\n"
-                        "FIELD, REG.FIELD, REG.n-m, PAGE:PAGE_ROW_NUMBER.FIELD or PAGE:PAGE_ROW_NUMBER.n-m to select a row field.\n\n"
-                        "where:\n\nREG and FIELD are names (or parts of names with fuzzy searches).\nPAGE and PAGE_ROW_NUMBER are page numbers and row within a page, "
-                        "ROW_NUMBER is an absolute row number offset, and n-m are the inclusive bit ranges of a field.")
+                        "The row/field selector, which can select a whole row:\n\n" \
+                        "ROW_NAME to select a whole row by name.\n" \
+                        "ROW_NUMBER to select a whole row by number.\n" \
+                        "PAGE:PAGE_ROW_NUMBER to select a whole row by page and number within page.\n\n" \
+                        "... or can select a single field/subset of a row (where ROW_SEL is one of the above row selectors):\n\n"
+                         "ROW_SEL.FIELD_NAME to select a field within a row by name.\n" \
+                        "ROW_SEL.n-m to select a range of bits within a row.\n" \
+                        "ROW_SEL.n to select a single bit within a row.\n" \
+                        ".FIELD_NAME to select any row's field by name.")
                 ) % "Row/Field Selection" +
                 integer("value").set(settings.otp.value) % "The value to set" +
                 (
@@ -1099,12 +1255,12 @@ struct otp_permissions_command : public cmd {
 
     group get_cli() override {
         return (
-                named_typed_file_selection_x("filename", 0, "json") % "File to load permissions from" +
+                named_untyped_file_selection_x("filename", 0) % "JSON file to load permissions from" +
                 (option("--led") & integer("pin").set(settings.otp.led_pin)) % "LED Pin to flash; default 25" +
                 (
                     option("--hash").set(settings.seal.hash) % "Hash the executable" +
                     option("--sign").set(settings.seal.sign) % "Sign the executable" +
-                    optional_typed_file_selection_x("key", 2, "pem") % "Key file"
+                    optional_untyped_file_selection_x("key", 2) % "Key file (.pem)"
                 ).min(0).doc_non_optional(true) % "Signing Configuration" +
                 device_selection % "Target device selection"
         );
@@ -1126,7 +1282,7 @@ struct otp_white_label_command : public cmd {
                 (
                         (option('s', "--start_row") & integer("row").set(settings.otp.row)) % "Start row for white label struct (default 0x100) (note use 0x for hex)"
                 ).min(0).doc_non_optional(true) % "Row options" +
-                named_typed_file_selection_x("filename", 0, "json") % "File with white labelling values" +
+                named_untyped_file_selection_x("filename", 0) % "JSON file with white labelling values" +
                 device_selection % "Target device selection"
         );
     }
@@ -1191,8 +1347,11 @@ struct uf2_convert_command : public cmd {
                 ).force_expand_help(true) % "Packaging Options" + 
                 (
                     option("--family") & family_id("family_id").set(settings.family_id) % "family ID for UF2"
-                ).force_expand_help(true) % "UF2 Family options"
-            #if SUPPORT_A2
+                ).force_expand_help(true) % "UF2 Family options" +
+                (
+                    option("--platform") & platform_model("platform").set(settings.model) % "optional platform for memory verification (eg rp2040, rp2350)"
+                ).force_expand_help(true) % "Platform options"
+            #if SUPPORT_RP2350_A2
                 + (
                     option("--abs-block").set(settings.uf2.abs_block) % "Add an absolute block" +
                         hex("abs_block_loc").set(settings.uf2.abs_block_loc).min(0) % "absolute block location (default to 0x10ffff00)"
@@ -1229,14 +1388,16 @@ struct coprodis_command : public cmd {
         return (
                 option("--quiet").set(settings.quiet) % "Don't print any output" +
                 option("--verbose").set(settings.verbose) % "Print verbose output" +
-                named_file_selection_x("infile", 0) % "Input DIS" +
-                named_file_selection_x("outfile", 1) % "Output DIS"
+                named_untyped_file_selection_x("infile", 0) % "Input DIS" +
+                named_untyped_file_selection_x("outfile", 1) % "Output DIS"
         );
     }
 
     string get_doc() const override {
         return "Post-process coprocessor instructions in disassembly files.";
     }
+
+    bool decode_line(uint32_t val, char *buf, size_t buf_len);
 };
 
 struct help_command : public cmd {
@@ -1263,8 +1424,12 @@ struct version_command : public cmd {
     bool execute(device_map &devices) override {
         if (settings.version.semantic)
             std::cout << PICOTOOL_VERSION << "\n";
-        else
+        else {
             std::cout << "picotool v" << PICOTOOL_VERSION << " (" << SYSTEM_VERSION << ", " << COMPILER_INFO << ")\n";
+            #if !HAS_LIBUSB
+            std::cout << built_without_libusb_message;
+            #endif
+        }
         if (!settings.version.version.empty()) {
             string picotool_v = string(PICOTOOL_VERSION);
             picotool_v = picotool_v.substr(0, picotool_v.find("-"));
@@ -1510,6 +1675,9 @@ int parse(const int argc, char **argv) {
             } else {
                 fos << string("Use \"picotool help ").append(selected_cmd->name()).append("\" for more info\n");
             }
+            #if !HAS_LIBUSB
+            fos << built_without_libusb_message;
+            #endif
         } else {
             cli::option_map options;
             selected_cmd->get_cli().get_option_help("", "", options);
@@ -1541,6 +1709,11 @@ int parse(const int argc, char **argv) {
             fos.hanging_indent(0);
             fos.wrap_hard();
             fos << "Use \"picotool help <cmd>\" for more info\n";
+            #if !HAS_LIBUSB
+            if (!help_mode) {
+                fos << built_without_libusb_message;
+            }
+            #endif
         }
         fos.flush();
     };
@@ -1674,24 +1847,24 @@ struct memory_access {
 
     virtual uint32_t get_binary_start() = 0;
 
-    uint32_t read_int(uint32_t addr) {
+    uint32_t read_int(uint32_t addr, bool zero_fill = false) {
         assert(!(addr & 3u));
         uint32_t rc;
-        read(addr, (uint8_t *)&rc, 4);
+        read(addr, (uint8_t *)&rc, 4, zero_fill);
         return rc;
     }
 
-    uint32_t read_short(uint32_t addr) {
+    uint32_t read_short(uint32_t addr, bool zero_fill = false) {
         assert(!(addr & 1u));
         uint16_t rc;
-        read(addr, (uint8_t *)&rc, 2);
+        read(addr, (uint8_t *)&rc, 2, zero_fill);
         return rc;
     }
 
     // read a vector of types that have a raw_type_mapping
-    template <typename T> void read_raw(uint32_t addr, T &v) {
+    template <typename T> void read_raw(uint32_t addr, T &v, bool zero_fill = false) {
         typename raw_type_mapping<T>::access_type& check = v; // ugly check that we aren't trying to read into something we shouldn't
-        read(addr, (uint8_t *)&v, sizeof(typename raw_type_mapping<T>::access_type));
+        read(addr, (uint8_t *)&v, sizeof(typename raw_type_mapping<T>::access_type), zero_fill);
     }
 
     // read a vector of types that have a raw_type_mapping
@@ -1710,35 +1883,25 @@ struct memory_access {
     // write a vector of types that have a raw_type_mapping
     template <typename T> void write_vector(uint32_t addr, vector<T> &v) {
         assert(v.size());
-        vector<typename raw_type_mapping<T>::access_type> buffer(v.size());
-        for(const auto &e : v) {
-            buffer.push_back(e);
-        }
-        write(addr, (uint8_t *)buffer.data(), v.size() * sizeof(typename raw_type_mapping<T>::access_type));
+        write(addr, (uint8_t *)v.data(), v.size() * sizeof(typename raw_type_mapping<T>::access_type));
     }
 
     template <typename T> void read_into_vector(uint32_t addr, unsigned int count, vector<T> &v, bool zero_fill = false) {
-        vector<typename raw_type_mapping<T>::access_type> buffer(count);
-        if (count) read(addr, (uint8_t *)buffer.data(), count * sizeof(typename raw_type_mapping<T>::access_type), zero_fill);
         v.clear();
-        v.reserve(count);
-        for(const auto &e : buffer) {
-            v.push_back(e);
+        v.resize(count);
+        if (count) {
+            read(addr, (uint8_t *)v.data(), count * sizeof(typename raw_type_mapping<T>::access_type), zero_fill);
         }
     }
-};
 
-static model_t get_model(memory_access &raw_access) {
-    auto magic = raw_access.read_int(BOOTROM_MAGIC_ADDR);
-    magic &= 0xffffff; // ignore bootrom version
-    if (magic == BOOTROM_MAGIC_RP2040) {
-        return rp2040;
-    } else if (magic == BOOTROM_MAGIC_RP2350) {
-        return rp2350;
-    } else {
-        return unknown;
+    model_t get_model() {
+        assert(model);
+        return model;
     }
-}
+
+protected:
+    model_t model = models::unknown; // something we can read from the start of ROM with
+};
 
 template<typename T>
 bool get_int(const std::string& s, T& out) {
@@ -1768,10 +1931,10 @@ bool get_json_int(json value, T& out) {
     }
 }
 
-uint32_t bootrom_func_lookup(memory_access& access, uint16_t tag) {
-    model_t model = get_model(access);
+uint32_t bootrom_func_lookup_rp2040(memory_access& access, uint16_t tag) {
+    model_t model = access.get_model();
     // we are only used on RP2040
-    if (model != rp2040) {
+    if (model->chip() != rp2040) {
         fail(ERROR_INCOMPATIBLE, "RP2040 BOOT ROM not found");
     }
 
@@ -1790,11 +1953,11 @@ uint32_t bootrom_func_lookup(memory_access& access, uint16_t tag) {
     return 0;
 }
 
-uint32_t bootrom_table_lookup_rp2350(memory_access& access, uint16_t tag, uint16_t flags) {
-    model_t model = get_model(access);
+uint32_t bootrom_table_lookup_v2(memory_access& access, uint16_t tag, uint16_t flags) {
+    model_t model = access.get_model();
     // we are only used on RP2350
-    if (model != rp2350) {
-        fail(ERROR_INCOMPATIBLE, "RP2350 BOOT ROM not found");
+    if (model->rom_table_version() != 2) {
+        fail(ERROR_INCOMPATIBLE, "BOOT ROM TABLE (v2) not found");
     }
 
     // dereference the table pointer
@@ -1836,24 +1999,81 @@ uint32_t bootrom_table_lookup_rp2350(memory_access& access, uint16_t tag, uint16
     return 0;
 }
 
-static uint32_t get_rom_git_revision(memory_access &raw_access) {
-    unsigned int addr = bootrom_table_lookup_rp2350(raw_access, rom_table_code('G','R'), RT_FLAG_DATA);
+static uint32_t get_rom_git_revision_v2(memory_access &raw_access) {
+    unsigned int addr = bootrom_table_lookup_v2(raw_access, rom_table_code('G','R'), RT_FLAG_DATA);
     return raw_access.read_int(addr);
 }
 
-static rp2350_version_t get_rp2350_version(memory_access &raw_access) {
-    switch (get_rom_git_revision(raw_access)) {
-        case 0x312e22fa:
-            return rp2350_a2;
-        default:
-            return rp2350_unknown;
+static model_t determine_model(memory_access &raw_access) {
+    auto raw = raw_access.read_int(BOOTROM_MAGIC_ADDR);
+    auto magic = raw & 0xf0ffffff; // ignoring bootrom version
+    if (magic == BOOTROM_MAGIC_RP2040) {
+        return std::make_shared<model_rp2040>();
+    } else if (magic == BOOTROM_MAGIC_RP2350) {
+        uint32_t table_entry = raw_access.read_short(BOOTROM_MAGIC_ADDR + 4);
+        static_assert(ROM_END_RP2350 == 0x8000, "");
+        if (table_entry < 0x8000) {
+            return std::make_shared<model_rp2350>();
+        } else {
+            return std::make_shared<model_rp2350>(0x10000);
+        }
     }
+    return models::unknown;
+}
+
+static inline bool is_transfer_aligned(uint32_t addr, const model_t& model) {
+    enum memory_type t = get_memory_type(addr, model);
+    return t != invalid && !(t == flash && addr & (PAGE_SIZE-1));
+}
+
+// this must be called after the right model is set on raw_access which is why it isn't
+// part of init_model
+static chip_revision_t determine_chip_revision(memory_access &raw_access) {
+    chip_revision_t chip_revision = unknown_revision;
+    model_t model = raw_access.get_model();
+    uint8_t rom_version;
+    raw_access.read_raw(0x13, rom_version);
+    if (model->chip() == rp2040) {
+        switch (rom_version) {
+            case 1:
+                chip_revision = rp2040_b0;
+                break;
+            case 2:
+                chip_revision = rp2040_b1;
+                break;
+            case 3:
+                chip_revision = rp2040_b2;
+                break;
+            default:
+                break;
+        };
+    } else if (model->chip() == rp2350) {
+        // switch (get_rom_git_revision_v2(raw_access)) {
+        //     default:
+        //         break;
+        // }
+        switch (rom_version) {
+            case 2:
+                chip_revision = rp2350_a2;
+                break;
+            case 3:
+                chip_revision = rp2350_a3;
+                break;
+            case 4:
+                chip_revision = rp2350_a4;
+                break;
+            default:
+                break;
+        };
+    }
+    return chip_revision;
 }
 #if HAS_LIBUSB
 struct picoboot_memory_access : public memory_access {
-    model_t model = unknown; // must be initialized to something up front as it is referenced before it is set to its final value
     explicit picoboot_memory_access(picoboot::connection &connection) : connection(connection) {
-        model = get_model(*this);
+        model = determine_model(*this);
+        if (model->chip() != unknown)
+            model->set_chip_revision(determine_chip_revision(*this));
     }
 
     bool is_device() override {
@@ -1865,10 +2085,73 @@ struct picoboot_memory_access : public memory_access {
     }
 
     void read(uint32_t address, uint8_t *buffer, unsigned int size, __unused bool zero_fill) override {
+        if (settings.use_flash_cache && flash == get_memory_type(address, model)) {
+            read_cached(address, buffer, size);
+        } else {
+            read_raw(address, buffer, size);
+        }
+    }
+
+    void clear_cache() {
+        flash_cache.clear();
+    }
+
+    void read_cached(uint32_t address, uint8_t *buffer, unsigned int size) {
+        for (auto range: flash_cache) {
+            uint32_t cached_start = std::get<0>(range);
+            uint32_t cached_size = std::get<1>(range);
+            auto cached_data = std::get<2>(range);
+            if (address >= cached_start) {
+                if (address >= cached_start + cached_size) {
+                    // No data already cached
+                    continue;
+                } else if (address + size <= cached_start + cached_size) {
+                    // All data already cached
+                    DEBUG_LOG("Flash Cache Hit %08x+%08x\n", address, size);
+                    std::copy(cached_data.cbegin() + (address - cached_start), cached_data.cbegin() + (address + size - cached_start), buffer);
+                    return;
+                } else {
+                    // Start of data already cached, but end needs reading
+                    uint32_t cached_used_size = cached_size - (address - cached_start);
+                    DEBUG_LOG("Flash Cache Hit Start %08x+%08x\n", address, cached_used_size);
+                    std::copy(cached_data.cbegin() + (address - cached_start), cached_data.cbegin() + cached_size, buffer);
+                    size -= cached_used_size;
+                    address += cached_used_size;
+                    buffer += cached_used_size;
+                }
+            } else {
+                if (address + size <= cached_start) {
+                    // No data already cached
+                    continue;
+                } else if (address + size <= cached_start + cached_size) {
+                    DEBUG_LOG("Flash Cache Hit End %08x+%08x\n", cached_start, (address + size - cached_start));
+                    // End of data already cached, but start needs reading
+                    std::copy(cached_data.cbegin(), cached_data.cbegin() + (address + size - cached_start), buffer + (cached_start - address));
+                    size = cached_start - address;
+                } else {
+                    // Middle of data already cached, start and end needs reading
+                    uint32_t split_size = cached_start - address; // split into address->cached_start and cached_start->(address + size)
+                    DEBUG_LOG("Flash Cache Hit Middle %08x+%08x\n", cached_start, cached_size);
+                    // Read data before
+                    read_cached(address, buffer, split_size);
+                    // Read rest
+                    read_cached(address + split_size, buffer + split_size, size - split_size);
+                    return;
+                }
+            }
+        }
+
+        DEBUG_LOG("Flash Caching %08x+%08x\n", address, size);
+        read_raw(address, buffer, size);
+        std::vector<uint8_t> cached_data(buffer, buffer + size);
+        flash_cache.push_back(std::make_tuple(address, size, cached_data));
+    }
+
+    void read_raw(uint32_t address, uint8_t *buffer, unsigned int size) {
         if (flash == get_memory_type(address, model)) {
             connection.exit_xip();
         }
-        if (model == rp2040 && rom == get_memory_type(address, model) && (address+size) >= 0x2000) {
+        if (model->chip() == rp2040 && rom == get_memory_type(address, model) && (address+size) >= 0x2000) {
             // read by memcpy instead
             unsigned int program_base = SRAM_START + 0x4000;
             // program is "return memcpy(SRAM_BASE, 0, 0x4000);"
@@ -1876,22 +2159,26 @@ struct picoboot_memory_access : public memory_access {
                     0x07482101, // movs r1, #1;       lsls r0, r1, #29
                     0x2100038a, // lsls r2, r1, #14;  movs r1, #0
                     0x47184b00, // ldr  r3, [pc, #0]; bx r3
-                    bootrom_func_lookup(*this, rom_table_code('M','C'))
+                    bootrom_func_lookup_rp2040(*this, rom_table_code('M','C'))
             };
             write_vector(program_base, program);
             connection.exec(program_base);
             // 4k is copied into the start of RAM
             connection.read(SRAM_START + address, (uint8_t *) buffer, size);
-        } else if (model == rp2350 && rom == get_memory_type(address, model) && (address+size) > 0x7e00) {
-            // Cannot read end section of rom from device
-            uint16_t unreadable_start = MAX(address, 0x7e00);
-            uint16_t unreadable_end = MIN(address+size, 0x8000);
+        } else if (contains_unreadable_rom(address, size, model)) {
+            // Cannot read end section of rom from device, so use the saved header for the chip
+            const unsigned char *unreadable_data = model->unreadable_rom_data();
+            if (unreadable_data == nullptr) {
+                fail(ERROR_INCOMPATIBLE, "Cannot read unreadable ROM data for %s revision %s", model->name().c_str(), model->revision_name().c_str());
+            }
+            uint16_t unreadable_start = MAX(address, model->unreadable_rom_start());
+            uint16_t unreadable_end = MIN(address+size, model->unreadable_rom_end());
             uint16_t idx = 0;
             if (address < unreadable_start) {
                 connection.read(address, (uint8_t *) buffer, unreadable_start - address);
                 idx += unreadable_start - address;
             }
-            memcpy(buffer+idx, rp2350_rom+(unreadable_start-0x7e00), unreadable_end - unreadable_start);
+            memcpy(buffer+idx, unreadable_data+(unreadable_start-(model->unreadable_rom_start())), unreadable_end - unreadable_start);
             idx += unreadable_end - unreadable_start;
             if (address + size > unreadable_end) {
                 connection.read(unreadable_end, (uint8_t *) buffer+idx, size - idx);
@@ -1950,6 +2237,7 @@ struct picoboot_memory_access : public memory_access {
         }
         if (is_transfer_aligned(address, model) && is_transfer_aligned(address + size, model)) {
             connection.write(address, (uint8_t *) buffer, size);
+            clear_cache(); // clear entire flash cache after any write, to be safe
         } else {
             // for write, we must be correctly sized/aligned in 256 byte chunks
             std::stringstream sstream;
@@ -1966,6 +2254,7 @@ struct picoboot_memory_access : public memory_access {
     bool erase = false;
 private:
     picoboot::connection& connection;
+    vector<std::tuple<uint32_t,uint32_t,vector<uint8_t>>> flash_cache;
 };
 #endif
 
@@ -1986,10 +2275,10 @@ struct iostream_memory_access : public memory_access {
     void read(uint32_t address, uint8_t *buffer, uint32_t size, bool zero_fill) override {
         if (address == BOOTROM_MAGIC_ADDR && size == 4) {
             // return the memory model
-            if (model == rp2040) {
+            if (model->chip()== rp2040) {
                 *(uint32_t*)buffer = BOOTROM_MAGIC_RP2040;
                 return;
-            } else if (model == rp2350) {
+            } else if (model->chip() == rp2350) {
                 *(uint32_t*)buffer = BOOTROM_MAGIC_RP2350;
                 return;
             } else {
@@ -2005,14 +2294,14 @@ struct iostream_memory_access : public memory_access {
                 assert(this_size);
                 file->seekg(result.second + result.first.offset, ios::beg);
                 file->read((char*)buffer, this_size);
-            } catch (not_mapped_exception &e) {
+            } catch (not_mapped_exception &) {
                 if (zero_fill) {
                     // address is not in a range, so fill up to next range with zeros
                     this_size = rmap.next(address) - address;
                     this_size = std::min(this_size, size);
                     memset(buffer, 0, this_size);
                 } else {
-                    throw e;
+                    throw;
                 }
             }
             buffer += this_size;
@@ -2045,7 +2334,6 @@ private:
     std::shared_ptr<std::iostream>file;
     range_map<size_t> rmap;
     uint32_t binary_start;
-    model_t model = unknown;
 };
 
 
@@ -2111,7 +2399,7 @@ private:
 
 struct partition_memory_access : public memory_access {
     partition_memory_access(memory_access &wrap, uint32_t partition_start) : wrap(wrap), partition_start(partition_start) {
-        model = get_model(wrap);
+        model = wrap.get_model();
     }
 
     void read(uint32_t address, uint8_t *buffer, unsigned int size, bool zero_fill) override {
@@ -2138,7 +2426,6 @@ struct partition_memory_access : public memory_access {
 private:
     memory_access& wrap;
     uint32_t partition_start;
-    model_t model;
 };
 
 static void read_and_check_elf32_header(std::shared_ptr<std::iostream>in, elf32_header& eh_out) {
@@ -2148,7 +2435,7 @@ static void read_and_check_elf32_header(std::shared_ptr<std::iostream>in, elf32_
     }
     try {
         rp_check_elf_header(eh_out);
-    } catch (command_failure &e) {
+    } catch (failure_error &e) {
         fail(e.code(), "'" + settings.filenames[0] +"' failed validation - " + e.what());
     }
 }
@@ -2168,12 +2455,12 @@ struct binary_info_header {
 
 bool find_binary_info(memory_access& access, binary_info_header &hdr) {
     uint32_t base = access.get_binary_start();
-    model_t model = get_model(access);
+    model_t model = access.get_model();
     if (!base) {
         fail(ERROR_FORMAT, "UF2 file does not contain a valid RP2 executable image");
     }
     uint32_t max_dist = 256;
-    if (model == rp2040) {
+    if (model->chip() == rp2040) {
         max_dist = 64;
         if (base == FLASH_START) base += 0x100; // skip the boot2
     }
@@ -2258,9 +2545,9 @@ struct bi_visitor_base {
 
     void visit(memory_access& access, const binary_info_header& hdr) {
         try {
-            model = get_model(access);
+            chip = access.get_model()->chip();
         } catch (not_mapped_exception&) {
-            model = rp2040;
+            chip = rp2040;
         }
         for (const auto &a : hdr.bi_addr) {
             visit(access, a);
@@ -2368,7 +2655,7 @@ struct bi_visitor_base {
     }
 
     virtual void pins(uint64_t pin_mask, int func, string name) {
-        if (model == rp2350) {
+        if (chip == rp2350) {
             pins(pin_mask, func, name, pin_functions_rp2350);
         } else {
             pins(pin_mask, func, name, pin_functions_rp2040);
@@ -2420,7 +2707,7 @@ struct bi_visitor_base {
 
     }
 
-    model_t model = model_t::unknown;
+    chip_t chip = chip_t::unknown;
 };
 
 struct bi_visitor : public bi_visitor_base {
@@ -2572,6 +2859,27 @@ uint32_t guess_flash_size(memory_access &access) {
     return size * 2;
 }
 
+// returns true if string is a hex string, and fills array with the values
+bool string_to_hex_array(const string& str, uint8_t *array, size_t size, const string& error_msg) {
+
+    if (!str.empty() && str.find("0x") == 0) {
+        // Hex string instead of file
+        if (str.size() != size*2 + 2) {
+            fail(ERROR_ARGS, "%s hex string must be %d characters long (the supplied string is %d characters)", error_msg.c_str(), size*2, str.size() - 2);
+        }
+        for (size_t i=0; i < size; i++) {
+            auto value = "0x" + str.substr(2 + i*2, 2);
+            auto ret = integer::parse_string(value, array[i]);
+            if (!ret.empty()) {
+                fail(ERROR_ARGS, "Invalid hex string: %s %s", value.c_str(), ret.c_str());
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
 std::shared_ptr<std::fstream> get_file_idx(ios::openmode mode, uint8_t idx) {
     auto filename = settings.filenames[idx];
     auto file = std::make_shared<std::fstream>(filename, mode);
@@ -2673,7 +2981,7 @@ uint32_t build_rmap_uf2(std::shared_ptr<std::iostream>file, range_map<size_t>& r
             if (block.flags & UF2_FLAG_FAMILY_ID_PRESENT &&
                 !(block.flags & UF2_FLAG_NOT_MAIN_FLASH) && block.payload_size == PAGE_SIZE &&
                 (!family_id || block.file_size == family_id)) {
-                #if SUPPORT_A2
+                #if SUPPORT_RP2350_A2
                 // ignore the absolute block, but save the address
                 if (check_abs_block(block)) {
                     DEBUG_LOG("Ignoring RP2350-E10 absolute block\n");
@@ -2689,11 +2997,11 @@ uint32_t build_rmap_uf2(std::shared_ptr<std::iostream>file, range_map<size_t>& r
                 next_family_id = 0;
                 #endif
             } else if (block.file_size != family_id && family_id && !next_family_id) {
-                #if SUPPORT_A2
+                #if SUPPORT_RP2350_A2
                 if (!check_abs_block(block)) {
                 #endif
                     next_family_id = block.file_size;
-                #if SUPPORT_A2
+                #if SUPPORT_RP2350_A2
                 }
                 #endif
             }
@@ -2708,7 +3016,12 @@ void build_rmap_load_map(std::shared_ptr<load_map_item>load_map, range_map<uint3
     for (unsigned int i=0; i < load_map->entries.size(); i++) {
         auto e = load_map->entries[i];
         if (e.storage_address != 0) {
-            rmap.insert(range(e.runtime_address, e.runtime_address + e.size), e.storage_address);
+            try {
+                rmap.insert(range(e.runtime_address, e.runtime_address + e.size), e.storage_address);
+            } catch (failure_error&) {
+                // Overlapping memory ranges are permitted in a load_map, so overwrite overlapping range
+                rmap.insert_overwrite(range(e.runtime_address, e.runtime_address + e.size), e.storage_address);
+            }
         }
     }
 }
@@ -2728,7 +3041,7 @@ uint32_t find_binary_start(range_map<size_t>& rmap) {
             }
         }
     }
-    if (get_memory_type(binary_start, rp2350) == invalid) { // pick biggest (rp2350) here for now
+    if (get_memory_type(binary_start, models::largest) == invalid) { // pick biggest (rp2350) here for now
         return 0;
     }
     return binary_start;
@@ -2829,9 +3142,9 @@ std::unique_ptr<block> find_best_block(memory_access &raw_access, vector<uint8_t
     std::unique_ptr<block> best_block = find_first_block(bin, raw_access.get_binary_start());
     if (best_block) {
         // verify stuff
-        get_more_bin_cb more_cb = [&raw_access](std::vector<uint8_t> &bin, uint32_t new_size) {
-            DEBUG_LOG("Now reading from %x size %x\n", raw_access.get_binary_start(), new_size);
-            bin = raw_access.read_vector<uint8_t>(raw_access.get_binary_start(), new_size, true);
+        get_more_bin_cb more_cb = [&raw_access](std::vector<uint8_t> &bin, uint32_t offset, uint32_t size) {
+            DEBUG_LOG("Now reading from %x size %x\n", offset, size);
+            bin = raw_access.read_vector<uint8_t>(offset, size, true);
         };
         auto all_blocks = get_all_blocks(bin, raw_access.get_binary_start(), best_block, more_cb);
 
@@ -2893,9 +3206,9 @@ std::unique_ptr<block> find_last_block(memory_access &raw_access, vector<uint8_t
     std::unique_ptr<block> first_block = find_first_block(bin, raw_access.get_binary_start());
     if (first_block) {
         // verify stuff
-        get_more_bin_cb more_cb = [&raw_access](std::vector<uint8_t> &bin, uint32_t new_size) {
-            DEBUG_LOG("Now reading from %x size %x\n", raw_access.get_binary_start(), new_size);
-            bin = raw_access.read_vector<uint8_t>(raw_access.get_binary_start(), new_size, true);
+        get_more_bin_cb more_cb = [&raw_access](std::vector<uint8_t> &bin, uint32_t offset, uint32_t size) {
+            DEBUG_LOG("Now reading from %x size %x\n", offset, size);
+            bin = raw_access.read_vector<uint8_t>(offset, size, true);
         };
         auto last_block = get_last_block(bin, raw_access.get_binary_start(), first_block, more_cb);
         return last_block;
@@ -2944,12 +3257,18 @@ string str_permissions(unsigned int p) {
 }
 
 void insert_default_families(uint32_t flags_and_permissions, vector<std::string> &family_ids) {
-    if (flags_and_permissions & PICOBIN_PARTITION_FLAGS_ACCEPTS_DEFAULT_FAMILY_ABSOLUTE_BITS) family_ids.emplace_back(absolute_family_name);
-    if (flags_and_permissions & PICOBIN_PARTITION_FLAGS_ACCEPTS_DEFAULT_FAMILY_RP2040_BITS) family_ids.emplace_back(rp2040_family_name);
-    if (flags_and_permissions & PICOBIN_PARTITION_FLAGS_ACCEPTS_DEFAULT_FAMILY_RP2350_ARM_S_BITS) family_ids.emplace_back(rp2350_arm_s_family_name);
-    if (flags_and_permissions & PICOBIN_PARTITION_FLAGS_ACCEPTS_DEFAULT_FAMILY_RP2350_ARM_NS_BITS) family_ids.emplace_back(rp2350_arm_ns_family_name);
-    if (flags_and_permissions & PICOBIN_PARTITION_FLAGS_ACCEPTS_DEFAULT_FAMILY_RP2350_RISCV_BITS) family_ids.emplace_back(rp2350_riscv_family_name);
-    if (flags_and_permissions & PICOBIN_PARTITION_FLAGS_ACCEPTS_DEFAULT_FAMILY_DATA_BITS) family_ids.emplace_back(data_family_name);
+    if (flags_and_permissions & PICOBIN_PARTITION_FLAGS_ACCEPTS_DEFAULT_FAMILY_ABSOLUTE_BITS) family_ids.emplace_back(family_name(ABSOLUTE_FAMILY_ID));
+    if (flags_and_permissions & PICOBIN_PARTITION_FLAGS_ACCEPTS_DEFAULT_FAMILY_RP2040_BITS) family_ids.emplace_back(family_name(RP2040_FAMILY_ID));
+    if (flags_and_permissions & PICOBIN_PARTITION_FLAGS_ACCEPTS_DEFAULT_FAMILY_RP2350_ARM_S_BITS) family_ids.emplace_back(family_name(RP2350_ARM_S_FAMILY_ID));
+    if (flags_and_permissions & PICOBIN_PARTITION_FLAGS_ACCEPTS_DEFAULT_FAMILY_RP2350_ARM_NS_BITS) family_ids.emplace_back(family_name(RP2350_ARM_NS_FAMILY_ID));
+    if (flags_and_permissions & PICOBIN_PARTITION_FLAGS_ACCEPTS_DEFAULT_FAMILY_RP2350_RISCV_BITS) family_ids.emplace_back(family_name(RP2350_RISCV_FAMILY_ID));
+    if (flags_and_permissions & PICOBIN_PARTITION_FLAGS_ACCEPTS_DEFAULT_FAMILY_DATA_BITS) family_ids.emplace_back(family_name(DATA_FAMILY_ID));
+}
+
+static chip_t image_type_exe_chip_to_chip(uint image_type_exe_chip) {
+    static_assert((int)chip_rp2040 == (int)rp2040, "");
+    static_assert((int)chip_rp2350 == (int)rp2350, "");
+    return (chip_t)image_type_exe_chip;
 }
 
 #if HAS_LIBUSB
@@ -2957,6 +3276,13 @@ void info_guts(memory_access &raw_access, picoboot::connection *con) {
 #else
 void info_guts(memory_access &raw_access, void *con) {
 #endif
+    // Use flash caching
+    settings.use_flash_cache = true;
+    // Callback to pass to bintool, to get more bin data
+    get_more_bin_cb more_cb = [&raw_access](std::vector<uint8_t> &bin, uint32_t offset, uint32_t size) {
+        DEBUG_LOG("Now reading from %x size %x\n", offset, size);
+        bin = raw_access.read_vector<uint8_t>(offset, size, true);
+    };
     try {
         struct group {
             explicit group(string name, bool enabled = true, int min_tab = 0) : name(std::move(name)), enabled(enabled), min_tab(min_tab) {}
@@ -2988,11 +3314,12 @@ void info_guts(memory_access &raw_access, void *con) {
                 infos[current_group].emplace_back(std::make_pair(name, value));
             }
         };
-        auto info_metadata = [&](std::vector<uint8_t> bin, block *current_block, bool verbose_metadata = false) {
+        auto info_metadata = [&](block *current_block, bool verbose_metadata = false) {
             verified_t hash_verified = none;
             verified_t sig_verified = none;
         #if HAS_MBEDTLS
-            verify_block(bin, raw_access.get_binary_start(), raw_access.get_binary_start(), current_block, hash_verified, sig_verified);
+            // Pass empty bin, which will be populated by more_cb if there is a signature/hash_value
+            verify_block({}, raw_access.get_binary_start(), raw_access.get_binary_start(), current_block, hash_verified, sig_verified, more_cb);
         #endif
 
             // Addresses
@@ -3007,34 +3334,32 @@ void info_guts(memory_access &raw_access, void *con) {
             if (image_def != nullptr) {
                 if (verbose_metadata) info_pair("block type", "image def");
                 if (image_def->image_type() == type_exe) {
-                    switch (image_def->chip()) {
-                        case chip_rp2040:
-                            info_pair("target chip", "RP2040");
-                            break;
-                        case chip_rp2350:
-                            info_pair("target chip", "RP2350");
-                            switch (image_def->cpu()) {
-                                case cpu_riscv:
-                                    info_pair("image type", "RISC-V");
-                                    break;
-                                case cpu_varmulet:
-                                    info_pair("image type", "Varmulet");
-                                    break;
-                                case cpu_arm:
-                                    if (image_def->security() == sec_s) {
-                                        info_pair("image type", "ARM Secure");
-                                    } else if (image_def->security() == sec_ns) {
-                                        info_pair("image type", "ARM Non-Secure");
-                                    } else if (image_def->security() == sec_unspecified) {
-                                        info_pair("image type", "ARM");
-                                    }
-                            }
-                            break;
-                        default:
-                            break;
+                    info_pair("target chip", chip_name(image_type_exe_chip_to_chip(image_def->chip())));
+                    if (image_def->chip() != chip_rp2040) {
+                        switch (image_def->cpu()) {
+                            case cpu_riscv:
+                                info_pair("image type", "RISC-V");
+                                break;
+                            case cpu_varmulet:
+                                info_pair("image type", "Varmulet");
+                                break;
+                            case cpu_arm:
+                                if (image_def->security() == sec_s) {
+                                    info_pair("image type", "ARM Secure");
+                                } else if (image_def->security() == sec_ns) {
+                                    info_pair("image type", "ARM Non-Secure");
+                                } else if (image_def->security() == sec_unspecified) {
+                                    info_pair("image type", "ARM");
+                                }
+                                break;
+                        }
                     }
                 } else if (image_def->image_type() == type_data) {
                     info_pair("image type", "data");
+                }
+                
+                if (image_def->tbyb()) {
+                    info_pair("tbyb", "not bought");
                 }
             }
 
@@ -3050,7 +3375,7 @@ void info_guts(memory_access &raw_access, void *con) {
                 unpartitioned << ", uf2 { " << cli::join(family_ids, ", ") << " }";
                 info_pair("un-partitioned space", unpartitioned.str());
 
-                for (int i=0; i < partition_table->partitions.size(); i++) {
+                for (size_t i=0; i < partition_table->partitions.size(); i++) {
                     std::stringstream pstring;
                     std::stringstream pname;
                     auto partition = partition_table->partitions[i];
@@ -3080,7 +3405,7 @@ void info_guts(memory_access &raw_access, void *con) {
                     family_ids.clear();
                     insert_default_families(flags, family_ids);
                     for (auto family : partition.extra_families) {
-                        family_ids.emplace_back(hex_string(family));
+                        family_ids.emplace_back(family_name(family));
                     }
                     if (flags & PICOBIN_PARTITION_FLAGS_HAS_NAME_BITS) {
                         pstring << ", \"";
@@ -3118,7 +3443,8 @@ void info_guts(memory_access &raw_access, void *con) {
                             ss << "Clear 0x" << std::hex << e.runtime_address;
                             ss << "->0x" << std::hex << e.runtime_address + e.size;
                         } else if (e.storage_address != e.runtime_address) {
-                            if (is_address_initialized(rp2350_address_ranges_flash, e.runtime_address)) {
+                            address_ranges ranges_flash = address_ranges_flash(raw_access.get_model());
+                            if (is_address_initialized(ranges_flash, e.runtime_address)) {
                                 ss << "ERROR: COPY TO FLASH NOT PERMITTED ";
                             }
                             ss << "Copy 0x" << std::hex << e.storage_address;
@@ -3372,18 +3698,14 @@ void info_guts(memory_access &raw_access, void *con) {
                 std::unique_ptr<block> first_block = find_first_block(bin, raw_access.get_binary_start());
                 if (first_block) {
                     // verify stuff
-                    get_more_bin_cb more_cb = [&raw_access](std::vector<uint8_t> &bin, uint32_t new_size) {
-                        DEBUG_LOG("Now reading from %x size %x\n", raw_access.get_binary_start(), new_size);
-                        bin = raw_access.read_vector<uint8_t>(raw_access.get_binary_start(), new_size, true);
-                    };
                     auto all_blocks = get_all_blocks(bin, raw_access.get_binary_start(), first_block, more_cb);
 
                     int block_i = 0;
                     select_group(metadata_info[block_i++], true);
-                    info_metadata(bin, first_block.get(), true);
+                    info_metadata(first_block.get(), true);
                     for (auto &block : all_blocks) {
                         select_group(metadata_info[block_i++], true);
-                        info_metadata(bin, block.get(), true);
+                        info_metadata(block.get(), true);
                     }
                 } else {
                     // This displays that there are no metadata blocks
@@ -3393,9 +3715,9 @@ void info_guts(memory_access &raw_access, void *con) {
             std::unique_ptr<block> best_block = find_best_block(raw_access, bin);
             if (best_block && (settings.info.show_basic || settings.info.all)) {
                 select_group(program_info);
-                info_metadata(bin, best_block.get());
-            } else if (!best_block && has_binary_info && get_model(raw_access) == rp2350) {
-                fos << "WARNING: Binary on RP2350 device does not contain a block loop - this binary will not boot\n";
+                info_metadata(best_block.get());
+            } else if (!best_block && has_binary_info && raw_access.get_model()->requires_block_loop()) {
+                fos << "WARNING: Binary on " << raw_access.get_model()->name() << " device does not contain a block loop - this binary will not boot\n";
             }
         } catch (std::invalid_argument &e) {
             fos << "Error reading binary info\n";
@@ -3409,29 +3731,14 @@ void info_guts(memory_access &raw_access, void *con) {
         std::vector<std::pair<string,string>> device_state_pairs;
         if ((settings.info.show_device || settings.info.all) && raw_access.is_device()) {
             select_group(device_info);
-            model_t model = get_model(raw_access);
+            model_t model = raw_access.get_model();
             uint8_t rom_version;
             raw_access.read_raw(0x13, rom_version);
-            if (model == rp2040) {
-                info_pair("type", "RP2040");
-                if (settings.info.show_debug || settings.info.all) {
-                    switch (rom_version) {
-                        case 1:
-                            info_pair("revision", "B0");
-                            break;
-                        case 2:
-                            info_pair("revision", "B1");
-                            break;
-                        case 3:
-                            info_pair("revision", "B2");
-                            break;
-                        default:
-                            info_pair("revision", "Unknown");
-                            break;
-                    }
-                }
-            } else if (model == rp2350) {
-                info_pair("type", "RP2350");
+            info_pair("type", model->name());
+            if (settings.info.show_debug || settings.info.all) {
+                info_pair("revision", model->revision_name());
+            }
+            if (model->supports_picoboot_cmd(PC_GET_INFO)) {
                 assert(con);
                 struct picoboot_get_info_cmd info_cmd;
                 info_cmd.bType = PICOBOOT_GET_INFO_SYS,
@@ -3442,38 +3749,30 @@ void info_guts(memory_access &raw_access, void *con) {
                                                           SYS_INFO_CHIP_INFO | SYS_INFO_CRITICAL |
                                                           SYS_INFO_CPU_INFO | SYS_INFO_FLASH_DEV_INFO);
                 uint32_t word_buf[64];
-                auto version = get_rp2350_version(raw_access);
-                if (settings.info.show_debug || settings.info.all) {
-                    switch (version) {
-                        case rp2350_a2:
-                            info_pair("revision", "A2");
-                            break;
-                        default:
-                            info_pair("revision", "Unknown");
-                            break;
-                    }
-                }
                 con->get_info(&info_cmd, (uint8_t *) word_buf, sizeof(word_buf));
                 uint32_t *data = word_buf;
                 unsigned int word_count = *data++;
                 unsigned int included = *data++;
                 if (included & SYS_INFO_CHIP_INFO) {
                     // package_id, device_id, wafer_id
-                    struct picoboot_otp_cmd otp_cmd;
-                    uint16_t num_gpios = 0;
-                    otp_cmd.wRow = OTP_DATA_NUM_GPIOS_ROW;
-                    otp_cmd.wRowCount = 1;
-                    otp_cmd.bEcc = 1;
-                    con->otp_read(&otp_cmd, (uint8_t *)&num_gpios, sizeof(num_gpios));
-                    if (num_gpios == 30) {
-                        info_pair("package", "QFN60");
-                    } else if (num_gpios == 48) {
-                        info_pair("package", "QFN80");
+                    if (model->chip_revision() == rp2350_a2) {
+                        // On A2, package_id is incorrect, so we use num_gpios instead
+                        struct picoboot_otp_cmd otp_cmd;
+                        uint16_t num_gpios = 0;
+                        otp_cmd.wRow = OTP_DATA_NUM_GPIOS_ROW;
+                        otp_cmd.wRowCount = 1;
+                        otp_cmd.bEcc = 1;
+                        con->otp_read(&otp_cmd, (uint8_t *)&num_gpios, sizeof(num_gpios));
+                        if (num_gpios == 30) {
+                            info_pair("package", "QFN60");
+                        } else if (num_gpios == 48) {
+                            info_pair("package", "QFN80");
+                        } else {
+                            info_pair("package", "unknown");
+                        }
                     } else {
-                        info_pair("package", "unknown");
+                        info_pair("package", data[0] ? "QFN60" : "QFN80");
                     }
-                    // Not correct on A2
-                    // info_pair("package", data[0] ? "QFN60" : "QFN80");
                     info_pair("chipid", hex_string(data[1] | (uint64_t)data[2] << 32, 16));
                     data += 3;
                 }
@@ -3546,7 +3845,7 @@ void info_guts(memory_access &raw_access, void *con) {
                     }
                 }
                 if (settings.info.show_debug || settings.info.all) {
-                    info_pair("rom gitrev", hex_string(get_rom_git_revision(raw_access)));
+                    info_pair("rom gitrev", hex_string(get_rom_git_revision_v2(raw_access)));
                 }
                 select_group(device_info);
             }
@@ -3555,7 +3854,7 @@ void info_guts(memory_access &raw_access, void *con) {
                 int32_t size_guess = guess_flash_size(raw_access);
                 if (size_guess > 0) {
                     info_pair("flash size", std::to_string(size_guess/1024) + "K");
-                    if (model == rp2040) {
+                    if (model->chip() == rp2040) {
                         uint64_t flash_id = 0;
                         con->flash_id(flash_id);
                         info_pair("flash id", hex_string(flash_id, 16, true, true));
@@ -3613,8 +3912,8 @@ void info_guts(memory_access &raw_access, void *con) {
             }
         }
         fos.flush();
-    } catch (not_mapped_exception&) {
-        std::cout << "\nfailed to read memory\n";
+    } catch (not_mapped_exception&e) {
+        std::cout << "\nfailed to read memory at " << hex_string(e.addr) << "\n";
     }
 }
 
@@ -3770,49 +4069,52 @@ bool help_command::execute(device_map &devices) {
     return false;
 }
 
-uint32_t get_access_family_id(memory_access &file_access) {
-    uint32_t family_id = 0;
+model_t get_access_model(memory_access &file_access) {
     vector<uint8_t> bin;
     std::unique_ptr<block> best_block = find_best_block(file_access, bin);
     if (best_block == NULL) {
         // No block, so RP2040 or absolute
         if (file_access.get_binary_start() == FLASH_START) {
             vector<uint8_t> checksum_data = {};
-            file_access.read_into_vector(FLASH_START, 252, checksum_data);
-            uint32_t checksum = file_access.read_int(FLASH_START + 252);
+            file_access.read_into_vector(FLASH_START, 252, checksum_data, true);
+            uint32_t checksum = file_access.read_int(FLASH_START + 252, true);
             if (checksum == calc_checksum(checksum_data)) {
                 // Checksum is correct, so RP2040
                 DEBUG_LOG("Detected family ID %s due to boot2 checksum\n", family_name(RP2040_FAMILY_ID).c_str());
-                return RP2040_FAMILY_ID;
+                return std::make_shared<model_rp2040>();
             } else {
                 // Checksum incorrect, so absolute
                 DEBUG_LOG("Assumed family ID %s\n", family_name(ABSOLUTE_FAMILY_ID).c_str());
-                return ABSOLUTE_FAMILY_ID;
+                model_t ret = std::make_shared<model_rp_generic>();
+                ret->set_family_id(ABSOLUTE_FAMILY_ID);
+                return ret;
             }
         } else {
             // no_flash RP2040 binaries have no checksum
             DEBUG_LOG("Assumed family ID %s\n", family_name(RP2040_FAMILY_ID).c_str());
-            return RP2040_FAMILY_ID;
+            return std::make_shared<model_rp2040>();
         }
     }
     auto first_item = best_block->items[0].get();
     if (first_item->type() != PICOBIN_BLOCK_ITEM_1BS_IMAGE_TYPE) {
         // This will apply for partition tables
         DEBUG_LOG("Assumed family ID %s due to block with no IMAGE_DEF\n", family_name(ABSOLUTE_FAMILY_ID).c_str());
-        return ABSOLUTE_FAMILY_ID;
+        model_t ret = std::make_shared<model_rp_generic>();
+        ret->set_family_id(ABSOLUTE_FAMILY_ID);
+        return ret;
     }
     auto image_def = dynamic_cast<image_type_item*>(first_item);
     if (image_def->image_type() == type_exe) {
         if (image_def->chip() == chip_rp2040) {
-            family_id = RP2040_FAMILY_ID;
+            return std::make_shared<model_rp2040>();
         } else if (image_def->chip() == chip_rp2350) {
             if (image_def->cpu() == cpu_riscv) {
-                family_id = RP2350_RISCV_FAMILY_ID;
+                return std::make_shared<model_rp2350_riscv>();
             } else if (image_def->cpu() == cpu_arm) {
                 if (image_def->security() == sec_s) {
-                    family_id = RP2350_ARM_S_FAMILY_ID;
+                    return std::make_shared<model_rp2350_arm_s>();
                 } else if (image_def->security() == sec_ns) {
-                    family_id = RP2350_ARM_NS_FAMILY_ID;
+                    return std::make_shared<model_rp2350_arm_ns>();
                 } else {
                     fail(ERROR_INCOMPATIBLE, "Cannot autodetect UF2 family: Unsupported security level %x\n", image_def->security());
                 }
@@ -3823,12 +4125,14 @@ uint32_t get_access_family_id(memory_access &file_access) {
             fail(ERROR_INCOMPATIBLE, "Cannot autodetect UF2 family: Unsupported chip %x\n", image_def->chip());
         }
     } else if (image_def->image_type() == type_data) {
-        family_id = DATA_FAMILY_ID;
+        model_t ret = std::make_shared<model_rp_generic>();
+        ret->set_family_id(DATA_FAMILY_ID);
+        return ret;
     } else {
         fail(ERROR_INCOMPATIBLE, "Cannot autodetect UF2 family: Unsupported image type %x\n", image_def->image_type());
     }
 
-    return family_id;
+    return models::unknown;
 }
 
 uint32_t get_family_id(uint8_t file_idx) {
@@ -3837,12 +4141,12 @@ uint32_t get_family_id(uint8_t file_idx) {
         family_id = settings.family_id;
     } else if (get_file_type_idx(file_idx) == filetype::elf || get_file_type_idx(file_idx) == filetype::bin) {
         auto file_access = get_file_memory_access(file_idx);
-        family_id = get_access_family_id(file_access);
+        family_id = get_access_model(file_access)->family_id();
     } else if (get_file_type_idx(file_idx) == filetype::uf2) {
         auto file = get_file_idx(ios::in|ios::binary, file_idx);
         uf2_block block;
         file->read((char*)&block, sizeof(block));
-        #if SUPPORT_A2
+        #if SUPPORT_RP2350_A2
         // ignore the absolute block
         if (check_abs_block(block)) {
             DEBUG_LOG("Ignoring RP2350-E10 absolute block\n");
@@ -3858,17 +4162,29 @@ uint32_t get_family_id(uint8_t file_idx) {
     return family_id;
 }
 
+model_t get_model(uint8_t file_idx) {
+    model_t model;
+    if (settings.model) {
+        model = settings.model;
+    } else {
+        auto file_access = get_file_memory_access(file_idx);
+        model = get_access_model(file_access);
+    }
+    // Clear the family ID, as get_family_id should be used for that, to allow command line override
+    model->set_family_id(0);
+    return model;
+}
+
 #if HAS_LIBUSB
 std::shared_ptr<vector<tuple<uint32_t, uint32_t>>> get_partitions(picoboot::connection &con) {
     picoboot_memory_access raw_access(con);
-    if (get_model(raw_access) != rp2350) {
-        // Not an rp2350, so no partitions
+    auto model = raw_access.get_model();
+    if (!model->supports_partition_table()) {
+        // no partition table
         return nullptr;
     }
 
-#if SUPPORT_A2
-    con.exit_xip();
-#endif
+    if (model->chip_revision() == rp2350_a2) con.exit_xip();
 
     uint8_t loc_flags_id_buf[256];
     uint8_t family_id_name_buf[256];
@@ -3896,7 +4212,6 @@ std::shared_ptr<vector<tuple<uint32_t, uint32_t>>> get_partitions(picoboot::conn
     }
 
     if (has_pt) {
-        auto rp2350_version = get_rp2350_version(raw_access);
         for (unsigned int i = 0; i < partition_count; i++) {
             uint32_t location_and_permissions = loc_flags_id_buf_32[lfi_pos++];
             uint32_t flags_and_permissions = loc_flags_id_buf_32[lfi_pos++];
@@ -3937,7 +4252,7 @@ bool config_command::execute(device_map &devices) {
             fos << "Multiple RP-series devices in BOOTSEL mode found:\n";
         }
         for (auto handles : devices[dr_vidpid_bootrom_ok]) {
-            selected_model = std::get<0>(handles);
+            selected_chip = std::get<0>(handles);
             fos.first_column(0); fos.hanging_indent(0);
             if (size > 1) {
                 auto s = bus_device_string(std::get<1>(handles), std::get<0>(handles));
@@ -3974,18 +4289,18 @@ bool config_command::execute(device_map &devices) {
     return false;
 }
 
+void set_model_from_metadata(file_memory_access& access) {
+    auto model = get_access_model(access);
+    access.set_model(model);
+}
+
 bool info_command::execute(device_map &devices) {
     fos.first_column(0); fos.hanging_indent(0);
     if (!settings.filenames[0].empty()) {
         uint32_t next_id = 0;
         auto access = get_file_memory_access(0, false, &next_id);
-        uint32_t id = 0;
-        id = get_family_id(0);
-        if (id == RP2040_FAMILY_ID) {
-            access.set_model(rp2040);
-        } else if (id >= RP2350_ARM_S_FAMILY_ID && id <= RP2350_ARM_NS_FAMILY_ID) {
-            access.set_model(rp2350);
-        }
+        set_model_from_metadata(access);
+        uint32_t id = get_family_id(0);
         if (next_id) {
             next_id = id;
             while (next_id) {
@@ -3999,6 +4314,7 @@ bool info_command::execute(device_map &devices) {
                 }
                 fos << s.str() << "\n\n";
                 auto tmp_access = get_file_memory_access(0, false, &next_id);
+                set_model_from_metadata(tmp_access);
                 info_guts(tmp_access, nullptr);
             }
         } else {
@@ -4018,7 +4334,7 @@ bool info_command::execute(device_map &devices) {
             fos << "Multiple RP-series devices in BOOTSEL mode found:\n";
         }
         for (auto handles : devices[dr_vidpid_bootrom_ok]) {
-            selected_model = std::get<0>(handles);
+            selected_chip = std::get<0>(handles);
             fos.first_column(0); fos.hanging_indent(0);
             if (size > 1) {
                 auto s = bus_device_string(std::get<1>(handles), std::get<0>(handles));
@@ -4095,18 +4411,19 @@ bool info_command::execute(device_map &devices) {
 static picoboot::connection get_single_bootsel_device_connection(device_map& devices, bool exclusive = true) {
     assert(devices[dr_vidpid_bootrom_ok].size() == 1);
     auto device = devices[dr_vidpid_bootrom_ok][0];
-    selected_model = std::get<0>(device);
+    selected_chip = std::get<0>(device);
     libusb_device_handle *rc = std::get<2>(device);
     if (!rc) fail(ERROR_USB, "Unable to connect to device");
-    return picoboot::connection(rc, std::get<0>(device), exclusive);
+    return picoboot::connection(rc, exclusive);
 }
 
-static picoboot::connection get_single_rp2350_bootsel_device_connection(device_map& devices, bool exclusive = true) {
+static picoboot::connection get_single_picoboot_cmd_compatible_device_connection(const std::string& cmd_name, device_map& devices, std::set<picoboot_cmd_id> picoboot_cmds, bool exclusive = true) {
     auto con = get_single_bootsel_device_connection(devices, exclusive);
     // todo amy we may have a different VID PID?
     picoboot_memory_access raw_access(con);
-    if (get_model(raw_access) != rp2350) {
-        fail(ERROR_INCOMPATIBLE, "RP2350 command cannot be used with a non RP2350 device");
+    std::string failed_device_name;
+    if (!raw_access.get_model()->supports_picoboot_cmds(picoboot_cmds, failed_device_name)) {
+        fail(ERROR_INCOMPATIBLE, "'%s' command cannot be used with a %s device", cmd_name.c_str(), failed_device_name.c_str());
     }
     return con;
 }
@@ -4229,13 +4546,14 @@ bool save_command::execute(device_map &devices) {
         }
     }
 
-    model_t model = get_model(raw_access);
+    model_t model = raw_access.get_model();
     enum memory_type t1 = get_memory_type(start , model);
     enum memory_type t2 = get_memory_type(end, model);
     if (t1 != t2 || t1 == invalid || t1 == sram_unstriped) {
         fail(ERROR_NOT_POSSIBLE, "Save range crosses unmapped memory");
     }
     uint32_t size = end - start;
+    uint32_t chunk_size = calculate_chunk_size(size);
 
     std::function<void(FILE *out, const uint8_t *buffer, unsigned int size, unsigned int offset)> writer256 = [](FILE *out, const uint8_t *buffer, unsigned int size, unsigned int offset) { assert(false); };
     uf2_block block;
@@ -4261,7 +4579,7 @@ bool save_command::execute(device_map &devices) {
             block.flags = UF2_FLAG_FAMILY_ID_PRESENT;
             block.payload_size = PAGE_SIZE;
             block.num_blocks = (size + PAGE_SIZE - 1)/PAGE_SIZE;
-            block.file_size = settings.family_id ? settings.family_id : get_access_family_id(raw_access);
+            block.file_size = settings.family_id ? settings.family_id : get_access_model(raw_access)->family_id();
             block.magic_end = UF2_MAGIC_END;
             writer256 = [&](FILE *out, const uint8_t *buffer, unsigned int size, unsigned int offset) {
                 static_assert(512 == sizeof(block), "");
@@ -4269,14 +4587,14 @@ bool save_command::execute(device_map &devices) {
                 block.block_no = offset / PAGE_SIZE;
                 assert(size <= PAGE_SIZE);
                 memcpy(block.data, buffer, size);
-                if (size < PAGE_SIZE) memset(block.data + size, 0, PAGE_SIZE);
+                if (size < PAGE_SIZE) memset(block.data + size, 0, PAGE_SIZE - size);
                 if (1 != fwrite(&block, sizeof(block), 1, out)) {
                     fail_write_error();
                 }
             };
             break;
         default:
-            throw command_failure(-1, "Unsupported output file type");
+            throw failure_error(-1, "Unsupported output file type");
     }
     FILE *out = fopen(settings.filenames[0].c_str(), "wb");
     if (out) {
@@ -4284,11 +4602,16 @@ bool save_command::execute(device_map &devices) {
             vector<uint8_t> buf;
             {
                 progress_bar bar("Saving file: ");
-                for (uint32_t addr = start; addr < end; addr += PAGE_SIZE) {
+                for (uint32_t addr = start; addr < end; addr += chunk_size) {
                     bar.progress(addr-start, end-start);
-                    uint32_t this_size = std::min(PAGE_SIZE, end - addr);
-                    raw_access.read_into_vector(addr, this_size, buf);
-                    writer256(out, buf.data(), this_size, addr - start);
+                    uint32_t this_chunk_size = std::min(chunk_size, end - addr);
+                    raw_access.read_into_vector(addr, this_chunk_size, buf);
+                    uint32_t remaining_size = this_chunk_size;
+                    while (remaining_size) {
+                        uint32_t this_size = std::min(PAGE_SIZE, remaining_size);
+                        writer256(out, buf.data() + (this_chunk_size - remaining_size), this_size, addr - start + (this_chunk_size - remaining_size));
+                        remaining_size -= this_size;
+                    }
                 }
                 bar.progress(100);
             }
@@ -4302,20 +4625,20 @@ bool save_command::execute(device_map &devices) {
     }
 
     if (settings.save.verify) {
+        raw_access.clear_cache();
         auto file_access = get_file_memory_access(0);
-        model_t model = get_model(raw_access);
+        model_t model = raw_access.get_model();
         auto ranges = get_coalesced_ranges(file_access, model);
         for (auto mem_range : ranges) {
             enum memory_type type = get_memory_type(mem_range.from, model);
             bool ok = true;
             {
                 progress_bar bar("Verifying " + memory_names[type] + ": ");
-                uint32_t batch_size = FLASH_SECTOR_ERASE_SIZE;
                 vector<uint8_t> file_buf;
                 vector<uint8_t> device_buf;
                 uint32_t pos = mem_range.from;
-                for (uint32_t base = mem_range.from; base < mem_range.to && ok; base += batch_size) {
-                    uint32_t this_batch = std::min(std::min(mem_range.to, end) - base, batch_size);
+                for (uint32_t base = mem_range.from; base < mem_range.to && ok; base += chunk_size) {
+                    uint32_t this_batch = std::min(std::min(mem_range.to, end) - base, chunk_size);
                     // note we pass zero_fill = true in case the file has holes, but this does
                     // mean that the verification will fail if those holes are not filled with zeros
                     // on the device
@@ -4363,8 +4686,18 @@ bool erase_command::execute(device_map &devices) {
         if (settings.load.partition >= partitions->size()) {
             fail(ERROR_NOT_POSSIBLE, "There are only %d partitions on the device", partitions->size());
         }
-        start = std::get<0>((*partitions)[settings.load.partition]);
-        end = std::get<1>((*partitions)[settings.load.partition]);
+        size_t tmp;
+        tmp = std::get<0>((*partitions)[settings.load.partition]);
+        if (tmp > UINT32_MAX) {
+            fail(ERROR_NOT_POSSIBLE, "Partition start address is too large");
+        }
+        start = tmp;
+        tmp = std::get<1>((*partitions)[settings.load.partition]);
+        if (tmp > UINT32_MAX) {
+            fail(ERROR_NOT_POSSIBLE, "Partition end address is too large");
+        }
+        end = tmp;
+
         printf("Erasing partition %d:\n", settings.load.partition);
         printf("  %08x->%08x\n", start, end);
         start += FLASH_START;
@@ -4385,7 +4718,7 @@ bool erase_command::execute(device_map &devices) {
         }
     }
 
-    model_t model = get_model(raw_access);
+    model_t model = raw_access.get_model();
     enum memory_type t1 = get_memory_type(start , model);
     enum memory_type t2 = get_memory_type(end, model);
     if (t1 != flash || t1 != t2) {
@@ -4408,9 +4741,9 @@ bool erase_command::execute(device_map &devices) {
 
 #if HAS_LIBUSB
 bool get_target_partition(picoboot::connection &con, uint32_t* start = nullptr, uint32_t* end = nullptr) {
-#if SUPPORT_A2
-    con.exit_xip();
-#endif
+    picoboot_memory_access raw_access(con);
+    auto model = raw_access.get_model();
+    if (model->chip_revision() == rp2350_a2) con.exit_xip();
 
     uint8_t loc_flags_id_buf[256];
     uint32_t *loc_flags_id_buf_32 = (uint32_t *)loc_flags_id_buf;
@@ -4459,7 +4792,7 @@ bool load_guts(picoboot::connection con, iostream_memory_access &file_access) {
             visitor.visit(access, hdr);
         }
     }
-    model_t model = get_model(raw_access);
+    model_t model = raw_access.get_model();
     auto ranges = get_coalesced_ranges(file_access, model);
     bool uses_flash = false;
     uint32_t flash_min = std::numeric_limits<uint32_t>::max();
@@ -4514,7 +4847,8 @@ bool load_guts(picoboot::connection con, iostream_memory_access &file_access) {
         // new scope for progress bar
         {
             progress_bar bar("Loading into " + memory_names[type] + ": ");
-            uint32_t batch_size = FLASH_SECTOR_ERASE_SIZE;
+            // Use batches of size/100 rounded up to FLASH_SECTOR_ERASE_SIZE
+            uint32_t batch_size = calculate_chunk_size(mem_range.len());
             bool ok = true;
             vector<uint8_t> file_buf;
             vector<uint8_t> device_buf;
@@ -4523,24 +4857,24 @@ bool load_guts(picoboot::connection con, iostream_memory_access &file_access) {
                 if (type == flash) {
                     // we have to erase an entire page, so then fill with zeros
                     range aligned_range(base & ~(FLASH_SECTOR_ERASE_SIZE - 1),
-                                        (base & ~(FLASH_SECTOR_ERASE_SIZE - 1)) + FLASH_SECTOR_ERASE_SIZE);
+                                        (base + this_batch + FLASH_SECTOR_ERASE_SIZE - 1) & ~(FLASH_SECTOR_ERASE_SIZE - 1));
                     range read_range(base, base + this_batch);
                     read_range.intersect(aligned_range);
                     file_access.read_into_vector(read_range.from, read_range.to - read_range.from, file_buf, true); // zero fill to cope with holes
-                    // zero padding up to FLASH_SECTOR_ERASE_SIZE
+                    // zero padding up to batch_size
                     file_buf.insert(file_buf.begin(), read_range.from - aligned_range.from, 0);
                     file_buf.insert(file_buf.end(), aligned_range.to - read_range.to, 0);
-                    assert(file_buf.size() == FLASH_SECTOR_ERASE_SIZE);
+                    assert(file_buf.size() == aligned_range.len());
 
                     bool skip = false;
                     if (settings.load.update) {
                         vector<uint8_t> read_device_buf;
-                        raw_access.read_into_vector(aligned_range.from, batch_size, read_device_buf);
+                        raw_access.read_into_vector(aligned_range.from, file_buf.size(), read_device_buf);
                         skip = file_buf == read_device_buf;
                     }
                     if (!skip) {
                         con.exit_xip();
-                        con.flash_erase(aligned_range.from, FLASH_SECTOR_ERASE_SIZE);
+                        con.flash_erase(aligned_range.from, file_buf.size());
                         raw_access.write_vector(aligned_range.from, file_buf);
                     }
                     base = read_range.to; // about to add batch_size
@@ -4559,7 +4893,7 @@ bool load_guts(picoboot::connection con, iostream_memory_access &file_access) {
             bool ok = true;
             {
                 progress_bar bar("Verifying " + memory_names[type] + ": ");
-                uint32_t batch_size = FLASH_SECTOR_ERASE_SIZE;
+                uint32_t batch_size = calculate_chunk_size(mem_range.len());
                 vector<uint8_t> file_buf;
                 vector<uint8_t> device_buf;
                 uint32_t pos = mem_range.from;
@@ -4597,7 +4931,7 @@ bool load_guts(picoboot::connection con, iostream_memory_access &file_access) {
         if (!start) {
             fail(ERROR_FORMAT, "Cannot execute as file does not contain a valid RP2 executable image");
         }
-        if (get_model(raw_access) == rp2350) {
+        if (raw_access.get_model()->supports_picoboot_cmd(PC_REBOOT2)) {
             struct picoboot_reboot2_cmd cmd;
             auto mt = get_memory_type(start, model);
             if (mt == flash) {
@@ -4609,13 +4943,13 @@ bool load_guts(picoboot::connection con, iostream_memory_access &file_access) {
                 unsigned int end;
                 switch (mt) {
                     case sram:
-                        end = SRAM_END_RP2350;
+                        end = model->sram_end();
                         break;
                     case xip_sram:
-                        end = XIP_SRAM_END_RP2350;
+                        end = model->xip_sram_end();
                         break;
                     default:
-                        end = SRAM_END_RP2350;
+                        end = model->sram_end();
                 }
                 cmd.dParam1 = end - start;
                 cmd.dFlags = REBOOT2_FLAG_REBOOT_TYPE_RAM_IMAGE;
@@ -4625,7 +4959,7 @@ bool load_guts(picoboot::connection con, iostream_memory_access &file_access) {
             con.reboot2(&cmd);
         } else {
             con.reboot(flash == get_memory_type(start, model) ? 0 : start,
-                       model == rp2040 ? SRAM_END_RP2040 : SRAM_END_RP2350, 500);
+                       model->sram_end(), 500);
         }
         std::cout << "\nThe device was rebooted to start the application.\n";
         return true;
@@ -4657,7 +4991,7 @@ bool load_command::execute(device_map &devices) {
         settings.family_id = family_id;
         uint32_t start;
         uint32_t end;
-        if (get_model(raw_access) != rp2040) {
+        if (raw_access.get_model()->supports_partition_table()) {
             if (get_target_partition(con, &start, &end)) {
                 settings.offset = start + FLASH_START;
                 settings.offset_set = true;
@@ -4674,7 +5008,7 @@ bool load_command::execute(device_map &devices) {
         }
     }
     auto file_access = get_file_memory_access(0);
-    if (settings.offset_set && get_file_type() != filetype::bin && get_model(raw_access) == rp2040) {
+    if (settings.offset_set && get_file_type() != filetype::bin && raw_access.get_model()->chip() == rp2040) {
         fail(ERROR_ARGS, "Offset only valid for BIN files");
     }
     bool ret = load_guts(con, file_access);
@@ -4682,101 +5016,48 @@ bool load_command::execute(device_map &devices) {
 }
 #endif
 
-#if HAS_MBEDTLS
-bool encrypt_command::execute(device_map &devices) {
-    bool isElf = false;
-    bool isBin = false;
-    if (get_file_type() == filetype::elf) {
-        isElf = true;
-    } else if (get_file_type() == filetype::bin) {
-        isBin = true;
-    } else {
-        fail(ERROR_ARGS, "Can only sign ELFs or BINs");
-    }
 
-    if (get_file_type_idx(1) != get_file_type()) {
-        fail(ERROR_ARGS, "Can only sign to same file type");
-    }
-
-    if (get_file_type_idx(2) != filetype::bin) {
-        fail(ERROR_ARGS, "Can only read AES key from BIN file");
-    }
-
-    if (settings.seal.sign && settings.filenames[3].empty()) {
-        fail(ERROR_ARGS, "missing key file for signing after encryption");
-    }
-
-    if (!settings.filenames[3].empty() && get_file_type_idx(3) != filetype::pem) {
-        fail(ERROR_ARGS, "Can only read pem keys");
-    }
-
-
-    auto aes_file = get_file_idx(ios::in|ios::binary, 2);
-    
-    private_t aes_key;
-    aes_file->read((char*)aes_key.bytes, sizeof(aes_key.bytes));
-
-
-    private_t private_key = {};
-    public_t public_key = {};
-
-    if (settings.seal.sign) read_keys(settings.filenames[3], &public_key, &private_key);
-
-    if (isElf) {
-        elf_file source_file(settings.verbose);
-        elf_file *elf = &source_file;
-        elf->read_file(get_file(ios::in|ios::binary));
-
-        std::unique_ptr<block> first_block = find_first_block(elf);
-        if (!first_block) {
-            fail(ERROR_FORMAT, "No first block found");
-        }
-        elf->editable = false;
-        block new_block = place_new_block(elf, first_block);
-        elf->editable = true;
-
-        encrypt(elf, &new_block, aes_key, public_key, private_key, settings.seal.hash, settings.seal.sign);
-
-        auto out = get_file_idx(ios::out|ios::binary, 1);
-        elf->write(out);
-        out->close();
-    } else if (isBin) {
-        auto binfile = get_file_memory_access(0);
-        auto rmap = binfile.get_rmap();
-        auto ranges = rmap.ranges();
-        assert(ranges.size() == 1);
-        auto bin_start = ranges[0].from;
-        auto bin_size = ranges[0].len();
-
-        vector<uint8_t> bin = binfile.read_vector<uint8_t>(bin_start, bin_size, false);
-
-        std::unique_ptr<block> first_block = find_first_block(bin, bin_start);
-        if (!first_block) {
-            fail(ERROR_FORMAT, "No first block found");
-        }
-        auto bin_cp = bin;
-        block new_block = place_new_block(bin_cp, bin_start, first_block);
-
-        auto enc_data = encrypt(bin, bin_start, bin_start, &new_block, aes_key, public_key, private_key, settings.seal.hash, settings.seal.sign);
-
-        auto out = get_file_idx(ios::out|ios::binary, 1);
-        out->write((const char *)enc_data.data(), enc_data.size());
-        out->close();
-    } else {
-        fail(ERROR_ARGS, "Must be ELF or BIN");
-    }
-
-    return false;
+static uint32_t even_parity(uint32_t input) {
+    return __builtin_popcount(input) & 1;
 }
+
+// In: 16-bit unsigned integer. Out: 22-bit unsigned integer.
+uint32_t __noinline otp_calculate_ecc(uint16_t x) {
+    // Source: db_shf40_ap_ab.pdf, page 25, "TABLE 9: PARITY BIT GENERATION MAP
+    // FOR 16 BIT USER DATA (X24 SHF MACROCELL)"
+    // https://drive.google.com/drive/u/1/folders/1jgU3tZt2BDeGkWUFhi6KZAlaYUpGrFaG
+    uint32_t p0 = even_parity(x & 0b1010110101011011);
+    uint32_t p1 = even_parity(x & 0b0011011001101101);
+    uint32_t p2 = even_parity(x & 0b1100011110001110);
+    uint32_t p3 = even_parity(x & 0b0000011111110000);
+    uint32_t p4 = even_parity(x & 0b1111100000000000);
+    uint32_t p5 = even_parity(x) ^ p0 ^ p1 ^ p2 ^ p3 ^ p4;
+    uint32_t p = p0 | (p1 << 1) | (p2 << 2) | (p3 << 3) | (p4 << 4) | (p5 << 5);
+    return x | (p << 16);
+}
+
 
 #if HAS_MBEDTLS
 void sign_guts_elf(elf_file* elf, private_t private_key, public_t public_key) {
     std::unique_ptr<block> first_block = find_first_block(elf);
     if (!first_block) {
-        fail(ERROR_FORMAT, "No first block found");
+        // Throw a clearer error for RP2040 binaries with no block loop
+        auto family_id = get_family_id(0);
+        if (family_id == RP2040_FAMILY_ID) {
+            fail(ERROR_FORMAT, "No metadata block found when sealing RP2040 binary - either use RP2350, or set PICO_CRT0_INCLUDE_PICOBIN_BLOCK=1");
+        } else {
+            fail(ERROR_FORMAT, "No metadata block found");
+        }
     }
 
-    block new_block = place_new_block(elf, first_block);
+    // Workaround RP2350-E13, which means when using rollback versions, all other blocks must be set as ignored
+    block new_block = place_new_block(elf, first_block, settings.seal.rollback_version);
+
+    if (settings.seal.set_tbyb) {
+        // Set the TBYB bit on the image_type_item
+        std::shared_ptr<image_type_item> image_type = new_block.get_item<image_type_item>();
+        image_type->flags |= PICOBIN_IMAGE_TYPE_EXE_TBYB_BITS;
+    }
 
     if (settings.seal.major_version || settings.seal.minor_version || settings.seal.rollback_version) {
         std::shared_ptr<version_item> version = new_block.get_item<version_item>();
@@ -4819,9 +5100,12 @@ void sign_guts_elf(elf_file* elf, private_t private_key, public_t public_key) {
                     }
                 }
             }
-            auto segment = elf->segment_from_physical_address(vtor_loc);
+            auto segment = elf->segment_from_virtual_address(vtor_loc);
+            if (segment == nullptr) {
+                fail(ERROR_NOT_POSSIBLE, "The ELF file does not contain the vector table location %x", vtor_loc);
+            }
             auto content = elf->content(*segment);
-            auto offset = vtor_loc - segment->physical_address();
+            auto offset = vtor_loc - segment->virtual_address();
             uint32_t ep;
             memcpy(&ep, content.data() + offset + 4, sizeof(ep));
             uint32_t sp;
@@ -4844,10 +5128,17 @@ vector<uint8_t> sign_guts_bin(iostream_memory_access in, private_t private_key, 
 
     std::unique_ptr<block> first_block = find_first_block(bin, bin_start);
     if (!first_block) {
-        fail(ERROR_FORMAT, "No first block found");
+        // Throw a clearer error for RP2040 binaries with no block loop
+        auto family_id = get_family_id(0);
+        if (family_id == RP2040_FAMILY_ID) {
+            fail(ERROR_FORMAT, "No metadata block found when sealing RP2040 binary - either use RP2350, or set PICO_CRT0_INCLUDE_PICOBIN_BLOCK");
+        } else {
+            fail(ERROR_FORMAT, "No metadata block found");
+        }
     }
 
-    block new_block = place_new_block(bin, bin_start, first_block);
+    // Workaround RP2350-E13, which means when using rollback versions, all other blocks must be set as ignored
+    block new_block = place_new_block(bin, bin_start, first_block, settings.seal.rollback_version);
 
     if (settings.seal.major_version || settings.seal.minor_version || settings.seal.rollback_version) {
         std::shared_ptr<version_item> version = new_block.get_item<version_item>();
@@ -4898,7 +5189,470 @@ vector<uint8_t> sign_guts_bin(iostream_memory_access in, private_t private_key, 
 
     return sig_data;
 }
-#endif
+
+bool encrypt_command::execute(device_map &devices) {
+    bool isElf = false;
+    bool isBin = false;
+
+    bool keyFromFile = true;
+    bool keyIsShare = false;
+    bool ivFromFile = true;
+
+    aes_key_t aes_key;
+    aes_key_share_t aes_key_share;
+    std::vector<uint8_t> iv_salt;
+    iv_salt.resize(16);
+
+    if (get_file_type() == filetype::elf) {
+        isElf = true;
+    } else if (get_file_type() == filetype::bin) {
+        if (settings.encrypt.embed) {
+            fail(ERROR_ARGS, "Can only embed decrypting bootloader into ELFs");
+        }
+        isBin = true;
+    } else {
+        fail(ERROR_ARGS, "Can only sign ELFs or BINs");
+    }
+
+    if (get_file_type_idx(1) != get_file_type()) {
+        fail(ERROR_ARGS, "Can only sign to same file type");
+    }
+
+    if (string_to_hex_array(settings.filenames[2], aes_key.bytes, sizeof(aes_key.bytes), "AES key")) {
+        keyFromFile = false;
+    } else if (get_file_type_idx(2) != filetype::bin) {
+        fail(ERROR_ARGS, "Can only read AES key or AES key share from BIN file");
+    }
+
+    if (string_to_hex_array(settings.filenames[3], iv_salt.data(), iv_salt.size(), "IV OTP salt")) {
+        ivFromFile = false;
+    } else if (get_file_type_idx(3) != filetype::bin) {
+        if (get_file_type_idx(3) == filetype::pem) {
+            // picotool encrypt <=2.1.1 would take PEM key file in the location of the IV OTP salt
+            fail(ERROR_ARGS, "This picotool version (%s) is not compatible with SDK versions <=2.1.1 - you must manually build & install picotool version 2.1.1 to use those SDK versions with encryption", PICOTOOL_VERSION);
+        }
+        fail(ERROR_ARGS, "Can only read IV OTP salt from BIN file");
+    }
+
+    if (settings.seal.sign && settings.filenames[4].empty()) {
+        fail(ERROR_ARGS, "missing key file for signing after encryption");
+    }
+
+    if (!settings.filenames[4].empty() && get_file_type_idx(4) != filetype::pem) {
+        fail(ERROR_ARGS, "Can only read pem keys");
+    }
+
+    if (keyFromFile) {
+        auto aes_file = get_file_idx(ios::in|ios::binary, 2);
+        aes_file->exceptions(std::iostream::failbit | std::iostream::badbit);
+        aes_file->seekg(0, std::ios::end);
+        auto aes_key_file_size = aes_file->tellg();
+        if (aes_key_file_size == 32) {
+            keyIsShare = false;
+            aes_file->seekg(0, std::ios::beg);
+            aes_file->read((char*)aes_key.bytes, sizeof(aes_key.bytes));
+        } else if (aes_key_file_size == 128) {
+            keyIsShare = true;
+            aes_file->seekg(0, std::ios::beg);
+            aes_file->read((char*)aes_key_share.bytes, sizeof(aes_key_share.bytes));
+        } else {
+            fail(ERROR_INCOMPATIBLE, "The AES key file must be a 128 byte key share, or a 32 byte key (the supplied file is %d bytes)", aes_key_file_size);
+        }
+    }
+
+    int min_weight = 6;
+    int max_weight = 10;
+    int min_combined_weight = 28;
+    int max_combined_weight = 36;
+
+    if (!keyIsShare) {
+        std::vector<int> num_attempts;
+        // Generate a random key share from 256-bit key
+        std::random_device rand{};
+        assert(rand.max() - rand.min() >= 256);
+        for(int i=0; i < 8; i++) {
+            // Regenerate the share word until the hamming weights are close to each other
+            bool pass = false;
+            for (int attempt=0; attempt < 100000; attempt++) {
+                for (int j=0; j < 12; j++) {
+                    aes_key_share.bytes[i*16 + j] = rand();
+                }
+                aes_key_share.words[i*4 + 3] = aes_key.words[i]
+                                            ^ aes_key_share.words[i*4]
+                                            ^ aes_key_share.words[i*4 + 1]
+                                            ^ aes_key_share.words[i*4 + 2];
+
+                pass = true;
+                for (int half=0; half < 2; half++) {
+                    uint8_t combined_weight = 0;
+                    for (int j=0; j < 4; j++) {
+                        uint16_t half_word = aes_key_share.words[i*4 + j] >> half*16;
+                        uint8_t weight = __builtin_popcount(half_word);
+                        if (weight < min_weight || weight > max_weight) {
+                            DEBUG_LOG("Generated share %d word %d half %d has hamming weights out of range %d -> %d - regenerating attempt %d\n", j, i, half, min_weight, max_weight, attempt);
+                            pass = false;
+                            break;
+                        }
+                        combined_weight += weight;
+                    }
+                    if (!pass) break;
+                    if (combined_weight < min_combined_weight || combined_weight > max_combined_weight) {
+                        DEBUG_LOG("Generated share word %d half %d has hamming weights out of range %d -> %d - regenerating attempt %d\n", i, half, min_combined_weight, max_combined_weight, attempt);
+                        pass = false;
+                        break;
+                    }
+                }
+                if (pass) {
+                    num_attempts.push_back(attempt);
+                    break;
+                }
+            }
+            if (!pass) {
+                fail(ERROR_INCOMPATIBLE, "Failed to generate a share word with hamming weights within %d -> %d", min_weight, max_weight);
+            }
+        }
+
+        DEBUG_LOG("Average number of attempts: %d\n", std::accumulate(num_attempts.begin(), num_attempts.end(), 0) / num_attempts.size());
+        DEBUG_LOG("Max number of attempts: %d\n", *std::max_element(num_attempts.begin(), num_attempts.end()));
+        DEBUG_LOG("Min number of attempts: %d\n", *std::min_element(num_attempts.begin(), num_attempts.end()));
+    } else {
+        // Check the share word hamming weights are close to each other
+        for(int i=0; i < 8; i++) {
+            for (int half=0; half < 2; half++) {
+                uint8_t combined_weight = 0;
+                for (int j=0; j < 4; j++) {
+                    uint16_t half_word = aes_key_share.words[i*4 + j] >> half*16;
+                    uint8_t weight = __builtin_popcount(half_word);
+                    if (weight < min_weight || weight > max_weight) {
+                        std::cout << "WARNING: Key Share " << j << " Word " << i << " half " << half << " has hamming weights out of range " << min_weight << " -> " << max_weight << " - this may leak information about the key\n";
+                    }
+                    combined_weight += weight;
+                }
+                if (combined_weight < min_combined_weight || combined_weight > max_combined_weight) {
+                    std::cout << "WARNING: Key Share Word " << i << " half " << half << " has hamming weights out of range " << min_combined_weight << " -> " << max_combined_weight << " - this may leak information about the key\n";
+                }
+            }
+        }
+    }
+
+    // Key is stored as a 4-way share of each word, ie X[0] = A[0] ^ B[0] ^ C[0] ^ D[0], stored as A[0], B[0], C[0], D[0]
+    for (int i=0; i < count_of(aes_key.words); i++) {
+        aes_key.words[i] = aes_key_share.words[i*4]
+                         ^ aes_key_share.words[i*4 + 1]
+                         ^ aes_key_share.words[i*4 + 2]
+                         ^ aes_key_share.words[i*4 + 3];
+    }
+
+    private_t private_key = {};
+    public_t public_key = {};
+
+    if (settings.seal.sign) read_keys(settings.filenames[4], &public_key, &private_key);
+
+    // Read IV Salt
+    if (ivFromFile) {
+        auto iv_salt_file = get_file_idx(ios::in|ios::binary, 3);
+        iv_salt_file->exceptions(std::iostream::failbit | std::iostream::badbit);
+        iv_salt_file->seekg(0, std::ios::end);
+        if (iv_salt_file->tellg() != 16) {
+            fail(ERROR_INCOMPATIBLE, "The IV OTP salt must be a 16 byte file (the supplied file is %d bytes)", iv_salt_file->tellg());
+        }
+        iv_salt_file->seekg(0, std::ios::beg);
+        iv_salt_file->read((char*)iv_salt.data(), iv_salt.size());
+    }
+
+    if (isElf) {
+        elf_file source_file(settings.verbose);
+        elf_file *elf = &source_file;
+        elf->read_file(get_file(ios::in|ios::binary));
+        // Remove any holes in the ELF file, as these cause issues when encrypting
+        elf->remove_ph_holes();
+        elf->remove_sh_holes();
+
+        std::unique_ptr<block> first_block = find_first_block(elf);
+        if (!first_block) {
+            fail(ERROR_FORMAT, "No first block found");
+        }
+        elf->editable = false;
+        block new_block = place_new_block(elf, first_block);
+        elf->editable = true;
+
+        // Delete existing load_map, as it will be invalid after encryption
+        std::shared_ptr<load_map_item> load_map = new_block.get_item<load_map_item>();
+        if (load_map != nullptr) {
+            new_block.items.erase(std::remove(new_block.items.begin(), new_block.items.end(), load_map), new_block.items.end());
+        }
+
+        if (settings.encrypt.embed) {
+            std::vector<uint8_t> iv_data;
+            std::vector<uint8_t> enc_data;
+            uint32_t data_start_address = SRAM_START;
+            encrypt_guts(elf, &new_block, aes_key, iv_data, enc_data);
+
+            // Salt IV
+            assert(iv_data.size() == iv_salt.size());
+            for (int i=0; i < iv_data.size(); i++) {
+                iv_data[i] ^= iv_salt[i];
+            }
+            auto tmp = std::make_shared<std::stringstream>();
+            auto file = get_enc_bootloader(settings.encrypt.use_mbedtls);
+            *tmp << file->rdbuf();
+
+            auto program = get_iostream_memory_access<iostream_memory_access>(tmp, filetype::elf, true);
+            // todo should be determined from image_def
+            program.set_model(std::make_shared<model_rp2350>());
+
+            // data_start_addr
+            settings.config.key = "data_start_addr";
+            settings.config.value = hex_string(data_start_address);
+            config_guts(program);
+            // data_size
+            settings.config.key = "data_size";
+            settings.config.value = hex_string(enc_data.size());
+            config_guts(program);
+            // iv
+            {
+                string s((char*)iv_data.data(), iv_data.size());
+                settings.config.key = "iv";
+                settings.config.value = s;
+                config_guts(program);
+            }
+            // otp_key_page
+            if (settings.encrypt.otp_key_page_set) {
+                settings.config.key = "otp_key_page";
+                settings.config.value = hex_string(settings.encrypt.otp_key_page);
+                config_guts(program);
+            }
+
+            // fast rosc
+            if (settings.encrypt.fast_rosc) {
+                settings.config.key = "rosc_div";
+                settings.config.value = "0x1";
+                config_guts(program);
+                settings.config.key = "rosc_drive";
+                settings.config.value = "0x0000";
+                config_guts(program);
+            }
+
+            elf_file source_file(settings.verbose);
+            elf_file *enc_elf = &source_file;
+            enc_elf->read_file(tmp);
+
+            // Bootloader size
+            auto bootloader_start = enc_elf->get_symbol("__enc_bootloader_start");
+            auto bootloader_end = enc_elf->get_symbol("__enc_bootloader_end");
+            uint32_t bootloader_size = bootloader_end - bootloader_start;
+
+            // Move bootloader down in physical space to start of SRAM (which will be start of flash once packaged)
+            enc_elf->move_all(data_start_address - bootloader_start);
+
+            // Add encrypted blob
+            enc_elf->append_segment(data_start_address, data_start_address + bootloader_size, enc_data.size(), ".enc_data");
+            auto data_section = enc_elf->get_section(".enc_data");
+            assert(data_section);
+            assert(data_section->virtual_address() == data_start_address);
+
+            if (data_section->size < enc_data.size()) {
+                fail(ERROR_UNKNOWN, "Block is too big for elf section\n");
+            }
+
+            DEBUG_LOG("Adding enc_data len %d\n", (int)enc_data.size());
+            for (auto x : enc_data) DEBUG_LOG("%02x", x);
+            DEBUG_LOG("\n");
+
+            enc_elf->content(*data_section, enc_data);
+
+            // Get the version from the encrypted binary
+            std::shared_ptr<version_item> version = new_block.get_item<version_item>();
+            if (version != nullptr) {
+                settings.seal.major_version = version->major;
+                settings.seal.minor_version = version->minor;
+                settings.seal.rollback_version = version->rollback;
+                for (auto row : version->otp_rows) {
+                    settings.seal.rollback_rows.push_back(row);
+                }
+            }
+
+            // Get the TBYB from the encrypted binary
+            std::shared_ptr<image_type_item> image_type = new_block.get_item<image_type_item>();
+            if (image_type->tbyb()) {
+                settings.seal.set_tbyb = true;
+            }
+
+            // Sign the final thing
+            settings.seal.clear_sram = true;
+            sign_guts_elf(enc_elf, private_key, public_key);
+
+            auto out = get_file_idx(ios::out|ios::binary, 1);
+            enc_elf->write(out);
+            out->close();
+        } else {
+            encrypt(elf, &new_block, aes_key, public_key, private_key, iv_salt, settings.seal.hash, settings.seal.sign);
+            auto out = get_file_idx(ios::out|ios::binary, 1);
+            elf->write(out);
+            out->close();
+        }
+    } else if (isBin) {
+        auto binfile = get_file_memory_access(0);
+        auto rmap = binfile.get_rmap();
+        auto ranges = rmap.ranges();
+        assert(ranges.size() == 1);
+        auto bin_start = ranges[0].from;
+        auto bin_size = ranges[0].len();
+
+        vector<uint8_t> bin = binfile.read_vector<uint8_t>(bin_start, bin_size, false);
+
+        std::unique_ptr<block> first_block = find_first_block(bin, bin_start);
+        if (!first_block) {
+            fail(ERROR_FORMAT, "No first block found");
+        }
+        auto bin_cp = bin;
+        block new_block = place_new_block(bin_cp, bin_start, first_block);
+
+        // Delete existing load_map, as it will be invalid after encryption
+        std::shared_ptr<load_map_item> load_map = new_block.get_item<load_map_item>();
+        if (load_map != nullptr) {
+            new_block.items.erase(std::remove(new_block.items.begin(), new_block.items.end(), load_map), new_block.items.end());
+        }
+
+        auto enc_data = encrypt(bin, bin_start, bin_start, &new_block, aes_key, public_key, private_key, iv_salt, settings.seal.hash, settings.seal.sign);
+
+        auto out = get_file_idx(ios::out|ios::binary, 1);
+        out->write((const char *)enc_data.data(), enc_data.size());
+        out->close();
+    } else {
+        fail(ERROR_ARGS, "Must be ELF or BIN");
+    }
+
+    if (!settings.filenames[5].empty()) {
+        if (get_file_type_idx(5) != filetype::json) {
+            fail(ERROR_ARGS, "Can only output OTP json");
+        }
+        auto check_json_file = std::ifstream(settings.filenames[5]);
+        json otp_json;
+        if (check_json_file.good()) {
+            otp_json = json::parse(check_json_file);
+            DEBUG_LOG("Appending to existing otp json\n");
+            check_json_file.close();
+        }
+        auto json_out = get_file_idx(ios::out, 5);
+
+    #define FIB_WORKAROUND 1
+    #if FIB_WORKAROUND
+        // Make inverse pages to work around OTP FIB attack
+        vector<uint8_t> page0_data;
+        page0_data.resize(64);
+        vector<uint8_t> page1_data;
+        page1_data.resize(64);
+        vector<uint8_t> page2_data;
+        page2_data.resize(iv_salt.size());
+
+        // Inverse pages need to be raw, to invert the ECC bits too
+        vector<uint8_t> page0_inverse;
+        page0_inverse.resize(page0_data.size()*2);
+        vector<uint8_t> page1_inverse;
+        page1_inverse.resize(page1_data.size()*2);
+        vector<uint8_t> page2_inverse;
+        page2_inverse.resize(page2_data.size()*2);
+
+        memcpy(page0_data.data(), aes_key_share.bytes, 64);
+        memcpy(page1_data.data(), aes_key_share.bytes + 64, 64);
+        memcpy(page2_data.data(), iv_salt.data(), iv_salt.size());
+
+        // The bits in rows 32-63 must be the inverse of the bits in rows 0-31
+        for (int i = 0; i < page0_data.size(); i += 2) {
+            page0_inverse[i*2] = ~page0_data[i];
+            page0_inverse[i*2+1] = ~page0_data[i+1];
+            page0_inverse[i*2+2] = ~otp_calculate_ecc(*(uint16_t*)&page0_data[i]) >> 16;
+        }
+        for (int i = 0; i < page1_data.size(); i += 2) {
+            page1_inverse[i*2] = ~page1_data[i];
+            page1_inverse[i*2+1] = ~page1_data[i+1];
+            page1_inverse[i*2+2] = ~otp_calculate_ecc(*(uint16_t*)&page1_data[i]) >> 16;
+        }
+        for (int i = 0; i < page2_data.size(); i += 2) {
+            page2_inverse[i*2] = ~page2_data[i];
+            page2_inverse[i*2+1] = ~page2_data[i+1];
+            page2_inverse[i*2+2] = ~otp_calculate_ecc(*(uint16_t*)&page2_data[i]) >> 16;
+        }
+
+        // Add otp AES key pages
+        for (int i = 0; i < page0_data.size(); i++) {
+            std::stringstream ss;
+            ss << settings.encrypt.otp_key_page << ":0";
+            otp_json[ss.str()]["ecc"] = true;
+            otp_json[ss.str()]["value"][i] = page0_data[i];
+        }
+        for (int i = 0; i < page1_data.size(); i++) {
+            std::stringstream ss;
+            ss << settings.encrypt.otp_key_page + 1 << ":0";
+            otp_json[ss.str()]["ecc"] = true;
+            otp_json[ss.str()]["value"][i] = page1_data[i];
+        }
+
+        // Add otp IV salt page
+        for (int i = 0; i < page2_data.size(); i++) {
+            std::stringstream ss;
+            ss << settings.encrypt.otp_key_page + 2 << ":0";
+            otp_json[ss.str()]["ecc"] = true;
+            otp_json[ss.str()]["value"][i] = page2_data[i];
+        }
+
+        // Add inverse pages
+        for (int i = 0; i < page0_inverse.size(); i++) {
+            std::stringstream ss;
+            ss << settings.encrypt.otp_key_page << ":32";
+            otp_json[ss.str()]["ecc"] = false;
+            otp_json[ss.str()]["value"][i] = page0_inverse[i];
+        }
+        for (int i = 0; i < page1_inverse.size(); i++) {
+            std::stringstream ss;
+            ss << settings.encrypt.otp_key_page + 1 << ":32";
+            otp_json[ss.str()]["ecc"] = false;
+            otp_json[ss.str()]["value"][i] = page1_inverse[i];
+        }
+        for (int i = 0; i < page2_inverse.size(); i++) {
+            std::stringstream ss;
+            ss << settings.encrypt.otp_key_page + 2 << ":32";
+            otp_json[ss.str()]["ecc"] = false;
+            otp_json[ss.str()]["value"][i] = page2_inverse[i];
+        }
+    #else
+        // Add otp AES key page
+        for (int i = 0; i < 128; ++i) {
+            std::stringstream ss;
+            ss << settings.encrypt.otp_key_page << ":0";
+            otp_json[ss.str()]["ecc"] = true;
+            otp_json[ss.str()]["value"][i] = aes_key_share.bytes[i];
+        }
+
+        // Add otp IV salt page
+        for (int i = 0; i < iv_salt.size(); ++i) {
+            std::stringstream ss;
+            ss << settings.encrypt.otp_key_page + 1 << ":0";
+            otp_json[ss.str()]["ecc"] = true;
+            otp_json[ss.str()]["value"][i] = iv_salt[i];
+        }
+    #endif
+
+        // Add page locks to prevent BL and NS access, and only allow S reads
+        {
+            std::stringstream ss;
+            ss << "PAGE" << settings.encrypt.otp_key_page << "_LOCK1";
+            otp_json[ss.str()] = "0x3d3d3d";
+            ss.str(string());
+            ss << "PAGE" << settings.encrypt.otp_key_page + 1 << "_LOCK1";
+            otp_json[ss.str()] = "0x3d3d3d";
+            ss.str(string());
+            ss << "PAGE" << settings.encrypt.otp_key_page + 2 << "_LOCK1";
+            otp_json[ss.str()] = "0x3d3d3d";
+        }
+
+        *json_out << std::setw(4) << otp_json << std::endl;
+        json_out->close();
+    }
+
+    return false;
+}
 
 bool seal_command::execute(device_map &devices) {
     bool isElf = false;
@@ -4962,6 +5716,8 @@ bool seal_command::execute(device_map &devices) {
         elf_file source_file(settings.verbose);
         elf_file *elf = &source_file;
         elf->read_file(get_file(ios::in|ios::binary));
+        // Remove any holes in the ELF file, as these cause issues when signing/hashing
+        elf->remove_sh_holes();
         sign_guts_elf(elf, private_key, public_key);
 
         auto out = get_file_idx(ios::out|ios::binary, 1);
@@ -4991,7 +5747,7 @@ bool seal_command::execute(device_map &devices) {
         auto tmp = std::make_shared<std::stringstream>();
         tmp->write(reinterpret_cast<const char*>(sig_data.data()), sig_data.size());
         auto out = get_file_idx(ios::out|ios::binary, 1);
-        bin2uf2(tmp, out, bin_start, family_id, settings.uf2.abs_block_loc);
+        bin2uf2(tmp, out, bin_start, family_id, access.get_model(), settings.uf2.abs_block_loc);
         out->close();
     } else {
         fail(ERROR_ARGS, "Must be ELF or BIN");
@@ -5035,13 +5791,7 @@ bool seal_command::execute(device_map &devices) {
 
     if (!settings.quiet) {
         auto access = get_file_memory_access(1);
-        uint32_t id = 0;
-        id = get_family_id(1);
-        if (id == RP2040_FAMILY_ID) {
-            access.set_model(rp2040);
-        } else if (id >= RP2350_ARM_S_FAMILY_ID && id <= RP2350_ARM_NS_FAMILY_ID) {
-            access.set_model(rp2350);
-        }
+        set_model_from_metadata(access);
         fos << "Output File " << settings.filenames[1] << ":\n\n";
         settings.info.show_basic = true;
         info_guts(access, nullptr);
@@ -5167,8 +5917,8 @@ bool verify_command::execute(device_map &devices) {
     auto file_access = get_file_memory_access(0);
     auto con = get_single_bootsel_device_connection(devices);
     picoboot_memory_access raw_access(con);
-    model_t model = get_model(raw_access);
-    if (settings.offset_set && get_file_type() != filetype::bin && get_model(raw_access) == rp2040) {
+    model_t model = raw_access.get_model();
+    if (settings.offset_set && get_file_type() != filetype::bin && model->chip() == rp2040) {
         fail(ERROR_ARGS, "Offset only valid for BIN files");
     }
     auto ranges = get_coalesced_ranges(file_access, model);
@@ -5194,7 +5944,7 @@ bool verify_command::execute(device_map &devices) {
                     progress_bar bar("Verifying " + memory_names[t1] + ": ");
                     vector<uint8_t> file_buf;
                     vector<uint8_t> device_buf;
-                    uint32_t batch_size = 1024;
+                    uint32_t batch_size = calculate_chunk_size(mem_range.len());
                     for(uint32_t base = mem_range.from; base < mem_range.to && ok; base += batch_size) {
                         uint32_t this_batch = std::min(mem_range.to - base, batch_size);
                         // note we pass zero_fill = true in case the file has holes, but this does
@@ -5415,7 +6165,7 @@ bool get_mask(const std::string& sel, uint32_t &mask, int max_bit) {
         bool ok = get_int(sel.substr(0, dash), from) &&
                   get_int(sel.substr(dash+1), to);
         if (!ok || to < from || from < 0 || to >= max_bit) {
-            fail(ERROR_ARGS, "Invalid bit-range in selector: %s; expect 'm-n' where m >= 0, n >= m and n <= %d", max_bit-1);
+            fail(ERROR_ARGS, "Invalid bit-range in selector: %s; expect 'm-n' where m >= 0, n >= m and n <= %d", sel.c_str(), max_bit-1);
         }
         mask = (2u << to) - (1u << from);
         return true;
@@ -5539,245 +6289,14 @@ std::map<std::pair<uint32_t,uint32_t>, otp_match> filter_otp(std::vector<string>
     return matches;
 }
 
-// todo we could make this popcount at the cost of having this not be Armv6m or adding the popcount instruction to varmulet for bootrom
-static uint32_t even_parity(uint32_t input) {
-    return __builtin_popcount(input) & 1;
-}
-
-// In: 16-bit unsigned integer. Out: 22-bit unsigned integer.
-uint32_t __noinline otp_calculate_ecc(uint16_t x) {
-    // Source: db_shf40_ap_ab.pdf, page 25, "TABLE 9: PARITY BIT GENERATION MAP
-    // FOR 16 BIT USER DATA (X24 SHF MACROCELL)"
-    // https://drive.google.com/drive/u/1/folders/1jgU3tZt2BDeGkWUFhi6KZAlaYUpGrFaG
-    uint32_t p0 = even_parity(x & 0b1010110101011011);
-    uint32_t p1 = even_parity(x & 0b0011011001101101);
-    uint32_t p2 = even_parity(x & 0b1100011110001110);
-    uint32_t p3 = even_parity(x & 0b0000011111110000);
-    uint32_t p4 = even_parity(x & 0b1111100000000000);
-    uint32_t p5 = even_parity(x) ^ p0 ^ p1 ^ p2 ^ p3 ^ p4;
-    uint32_t p = p0 | (p1 << 1) | (p2 << 2) | (p3 << 3) | (p4 << 4) | (p5 << 5);
-    return x | (p << 16);
-}
-
-#if HAS_LIBUSB
-static void hack_init_otp_regs(picoboot::connection& con) {
-    // build map of OTP regs by offset
-    if (settings.otp.extra_files.size() > 0) {
-        DEBUG_LOG("Using extra OTP files:\n");
-        for (auto file : settings.otp.extra_files) {
-            DEBUG_LOG("%s\n", file.c_str());
-        }
-    }
-    init_otp(otp_regs, settings.otp.extra_files);
-    picoboot_memory_access raw_access(con);
-}
-bool otp_get_command::execute(device_map &devices) {
-    auto con = get_single_rp2350_bootsel_device_connection(devices);
-    hack_init_otp_regs(con);
-    auto matches = filter_otp(settings.otp.selectors, settings.otp.ecc ? 16 : 24, settings.otp.fuzzy);
-    uint32_t last_reg_row = 1; // invalid
-    bool first = true;
-    char buf[512];
-    uint32_t raw_buffer[OTP_PAGE_ROWS];
-    memset(raw_buffer, 0xaa, sizeof(raw_buffer));
-    int indent0 = settings.otp.list_pages ? 18 : 8;
-    uint32_t last_page = -1;
-    picoboot_memory_access raw_access(con);
-    for (const auto& e : matches) {
-        const auto &m = e.second;
-        bool do_ecc = settings.otp.ecc;
-        int redundancy = settings.otp.redundancy;
-        uint32_t corrected_val = 0;
-        if (m.reg_row / OTP_PAGE_ROWS != last_page) {
-            // todo pre-check page lock
-            struct picoboot_otp_cmd otp_cmd;
-            if (m.reg_row / OTP_PAGE_ROWS >= 62) {
-                // Read individual rows for lock words
-                otp_cmd.wRow = m.reg_row;
-                otp_cmd.wRowCount = 1;
-                otp_cmd.bEcc = 0;
-                con.otp_read(&otp_cmd, (uint8_t *)&(raw_buffer[m.reg_row % OTP_PAGE_ROWS]), sizeof(raw_buffer[0]));
-            } else {
-                // Otherwise read a page at a time
-                last_page = m.reg_row / OTP_PAGE_ROWS;
-                otp_cmd.wRow = last_page * OTP_PAGE_ROWS;
-                otp_cmd.wRowCount = OTP_PAGE_ROWS;
-                otp_cmd.bEcc = 0;
-                con.otp_read(&otp_cmd, (uint8_t *)raw_buffer, sizeof(raw_buffer));
-            }
-        }
-        if (m.reg_row != last_reg_row) {
-            last_reg_row = m.reg_row;
-            // Write out header for row
-            fos.first_column(0);
-            if (!first) fos.wrap_hard();
-            first = false;
-            fos.hanging_indent(7);
-            snprintf(buf, sizeof(buf), "ROW 0x%04x", m.reg_row);
-            fos << buf;
-            if (settings.otp.list_pages) {
-                snprintf(buf, sizeof(buf), " (0x%02x:0x%02x)", m.reg_row / OTP_PAGE_ROWS,
-                         m.reg_row % OTP_PAGE_ROWS);
-                fos << buf;
-            }
-            if (m.reg) {
-                fos << ": " << m.reg->name;
-                if (settings.otp.list_no_descriptions) {
-                    if (m.reg->ecc) {
-                        fos << " (ECC)";
-                    } else if (m.reg->crit) {
-                        fos << " (CRIT)";
-                    } else if (m.reg->redundancy) {
-                        fos << " (RBIT-" << m.reg->redundancy << ")";
-                    }
-                }
-                if (m.reg->seq_length) {
-                    fos << " (Part " << (m.reg->seq_index + 1) << "/" << m.reg->seq_length << ")";
-                }
-                // Set the ecc and redundancy, unless the user specified values
-                do_ecc |= (m.reg->ecc && !settings.otp.raw);
-                if (redundancy < 0) redundancy = m.reg->redundancy;
-            }
-            fos << "\n";
-            if (m.reg && !settings.otp.list_no_descriptions && !m.reg->description.empty()) {
-                fos.first_column(indent0);
-                fos.hanging_indent(0);
-                fos << "\"" << m.reg->description << "\"";
-                fos.first_column(0);
-                fos << "\n";
-            }
-            fos.first_column(4);
-            fos.hanging_indent(10);
-            uint32_t raw_value = raw_buffer[m.reg_row % OTP_PAGE_ROWS];
-            char raw_buf[16 * 1024];
-            uint8_t buf_pos = 0;
-            buf_pos += snprintf(raw_buf+buf_pos, sizeof(raw_buf), "RAW_VALUE=0x%06x", raw_value);
-            for (int i=1; i < std::max(redundancy, 1); i++) {
-                raw_value = raw_buffer[(m.reg_row % OTP_PAGE_ROWS) + i];
-                buf_pos += snprintf(raw_buf+buf_pos, sizeof(raw_buf) - buf_pos, ";0x%06x", raw_value);
-                if (3 == (raw_value >> 22)) {
-                    raw_value ^= 0xffffff;
-                    snprintf(buf, sizeof(buf), "(flipping raw value to 0x%08x)", raw_value);
-                    fos << buf;
-                }
-            }
-            if (do_ecc) {
-                corrected_val = otp_calculate_ecc(raw_value &0xffff);
-                snprintf(buf, sizeof(buf), "\nVALUE 0x%06x\n", corrected_val);
-                fos << buf;
-                // todo more clarity over ECC settigns
-                // todo recovery
-                if (corrected_val != raw_value) {
-                    fos << raw_buf;
-                    fos << " (WARNING - ECC IS INVALID)";
-                }
-            } else if (redundancy > 0) {
-                uint8_t sets[24] = {};
-                uint8_t clears[24] = {};
-                bool diff = false;
-                bool crit = m.reg ? m.reg->crit : false;
-                for (int i=0; i < redundancy; i++) {
-                    raw_value = raw_buffer[(m.reg_row % OTP_PAGE_ROWS) + i];
-                    for (int b=0; b < 24; b++) raw_value & (1 << b) ? sets[b]++ : clears[b]++;
-                }
-                for (int b=0; b < 24; b++){
-                    if(sets[b] >= clears[b] || (crit && sets[b] >= 3)) corrected_val |= (1 << b);
-                    if (sets[b] && clears[b]) diff = true;
-                }
-                snprintf(buf, sizeof(buf), "\nVALUE 0x%06x\n", corrected_val);
-                if (diff) {
-                    fos << raw_buf;
-                    fos << " (WARNING - REDUNDANT ROWS AREN'T EQUAL)";
-                }
-                fos << buf;
-            } else {
-                corrected_val = raw_value;
-                snprintf(buf, sizeof(buf), "\nVALUE 0x%06x\n", corrected_val);
-                fos << buf;
-            }
-            fos << "\n";
-        }
-        if (m.reg) {
-            for (const auto &f: m.reg->fields) {
-                if (f.mask & m.mask) {
-                    fos.first_column(4);
-                    fos.hanging_indent(10);
-                    // todo should we care if the fields overlap - i think this is fine for here in list
-                    int low = __builtin_ctz(f.mask);
-                    int high = 31 - __builtin_clz(f.mask);
-                    fos << "field " << f.name;
-                    if (low == high) {
-                        fos << " (bit " << low << ")";
-                    } else {
-                        fos << " (bits " << low << "-" << high << ")";
-                    }
-                    snprintf(buf, sizeof(buf), " = %x\n", (corrected_val & f.mask) >> low);
-                    fos << buf;
-                    if (!settings.otp.list_no_descriptions && !f.description.empty()) {
-                        fos.first_column(indent0);
-                        fos.hanging_indent(0);
-                        fos << "\"" << f.description << "\"";
-                        fos.first_column(0);
-                        fos << "\n";
-                    }
-                }
-            }
-        }
-    #if ENABLE_DEBUG_LOG
-        if (do_ecc) {
-            struct picoboot_otp_cmd otp_cmd;
-            otp_cmd.wRow = m.reg_row;
-            otp_cmd.bEcc = 1;
-            otp_cmd.wRowCount = 1;
-            uint16_t val = 0xaaaa;
-            con.otp_read(&otp_cmd, (uint8_t *)&val, sizeof(val));
-            snprintf(buf, sizeof(buf), "EXTRA ECC READ: %04x\n", val);
-            fos << buf;
-        }
-    #endif
-    }
-    return false;
-}
-#endif
-
-#if HAS_LIBUSB
-bool otp_dump_command::execute(device_map &devices) {
-    auto con = get_single_rp2350_bootsel_device_connection(devices, false);
-    // todo pre-check page lock
-    struct picoboot_otp_cmd otp_cmd;
-    otp_cmd.wRow = 0;
-    otp_cmd.wRowCount = OTP_ROW_COUNT;
-    otp_cmd.bEcc = settings.otp.ecc && !settings.otp.raw;
-    vector<uint8_t> raw_buffer;
-    raw_buffer.resize(otp_cmd.wRowCount * (otp_cmd.bEcc ? 2 : 4));
-    picoboot_memory_access raw_access(con);
-    con.otp_read(&otp_cmd, raw_buffer.data(), raw_buffer.size());
-    fos.first_column(0);
-    char buf[256];
-    for(int i=0;i<OTP_ROW_COUNT;i+=8) {
-        snprintf(buf, sizeof(buf), "%04x: ", i);
-        fos << buf;
-        for (int j = i; j < i + 8; j++) {
-            if (otp_cmd.bEcc) {
-                snprintf(buf, sizeof(buf), "%04x, ", ((uint16_t *) raw_buffer.data())[j]);
-            } else {
-                snprintf(buf, sizeof(buf), "%08x, ", ((uint32_t *) raw_buffer.data())[j]);
-            }
-            fos << buf;
-        }
-        fos << "\n";
-    }
-    return false;
-}
-#endif
 
 #if HAS_LIBUSB
 bool partition_info_command::execute(device_map &devices) {
-    auto con = get_single_rp2350_bootsel_device_connection(devices, false);
+    auto con = get_single_picoboot_cmd_compatible_device_connection("partition info", devices, {PC_GET_INFO}, false);
 
-#if SUPPORT_A2
-    con.exit_xip();
-#endif
+    picoboot_memory_access raw_access(con);
+    model_t model = raw_access.get_model();
+    if (model->chip_revision() == rp2350_a2) con.exit_xip();
 
     uint8_t loc_flags_id_buf[256];
     uint8_t family_id_name_buf[256];
@@ -5809,8 +6328,6 @@ bool partition_info_command::execute(device_map &devices) {
     printf(", uf2 { %s }\n", cli::join(family_ids, ", ").c_str());
 
     if (has_pt) {
-        picoboot_memory_access raw_access(con);
-        auto rp2350_version = get_rp2350_version(raw_access);
         printf("partitions:\n");
         for (unsigned int i = 0; i < partition_count; i++) {
             uint32_t location_and_permissions = loc_flags_id_buf_32[lfi_pos++];
@@ -5861,7 +6378,7 @@ bool partition_info_command::execute(device_map &devices) {
                 assert((flags_and_permissions & PICOBIN_PARTITION_FLAGS_HAS_NAME_BITS) ||
                        got == num_extra_families + 1);
                 for (unsigned int j = 1; j < num_extra_families + 1; j++) {
-                    family_ids.emplace_back(hex_string(family_id_name_buf_32[j + 1]));
+                    family_ids.emplace_back(family_name(family_id_name_buf_32[j + 1]));
                 }
                 if (flags_and_permissions & PICOBIN_PARTITION_FLAGS_HAS_NAME_BITS) {
                     uint8_t *bytes = &family_id_name_buf[(num_extra_families + 2) * 4];
@@ -5965,7 +6482,8 @@ bool partition_create_command::execute(device_map &devices) {
     uint32_t unpartitioned_flags = permissions_to_flags(pt_json["unpartitioned"]["permissions"]) | families_to_flags(pt_json["unpartitioned"]["families"]);
     partition_table_item pt(unpartitioned_flags, settings.partition.singleton);
 
-#if SUPPORT_A2
+#if SUPPORT_RP2350_A2
+    // todo fix test
     if (!(unpartitioned_flags & PICOBIN_PARTITION_FLAGS_ACCEPTS_DEFAULT_FAMILY_ABSOLUTE_BITS)) {
         fail(ERROR_INCOMPATIBLE, "Unpartitioned space must accept the absolute family, for the RP2350-E10 fix to work");
     }
@@ -5989,9 +6507,9 @@ bool partition_create_command::execute(device_map &devices) {
         }
 
         cur_pos = start + size;
-    #if SUPPORT_A2
+    #if SUPPORT_RP2350_A2
         if (start <= (settings.uf2.abs_block_loc - FLASH_START)/0x1000 && start + size > (settings.uf2.abs_block_loc - FLASH_START)/0x1000) {
-            fail(ERROR_INCOMPATIBLE, "The address %lx cannot be in a partition for the RP2350-E10 fix to work", settings.uf2.abs_block_loc);
+            fail(ERROR_INCOMPATIBLE, "The address %" PRIx32 " cannot be in a partition for the RP2350-E10 fix to work", settings.uf2.abs_block_loc);
         }
     #endif
         new_p.first_sector = start;
@@ -6007,7 +6525,7 @@ bool partition_create_command::execute(device_map &devices) {
                 fail(ERROR_FORMAT, "Could not parse family ID from %s: %s", family.c_str(), ret.c_str());
             }
             DEBUG_LOG("Got ID %08x\n", id);
-            if (id < RP2040_FAMILY_ID || id > FAMILY_ID_MAX) {
+            if (id < BOOTROM_FAMILY_ID_MIN || id > BOOTROM_FAMILY_ID_MAX) {
                 DEBUG_LOG("Adding extra family\n");
                 new_p.extra_families.push_back(id);
             }
@@ -6032,7 +6550,13 @@ bool partition_create_command::execute(device_map &devices) {
             }
             new_p.flags |= (link_value << PICOBIN_PARTITION_FLAGS_LINK_VALUE_LSB) & PICOBIN_PARTITION_FLAGS_LINK_VALUE_BITS;
         }
-        if (p.contains("name")) { new_p.name = p["name"]; new_p.flags |= PICOBIN_PARTITION_FLAGS_HAS_NAME_BITS; }
+        if (p.contains("name")) {
+            new_p.name = p["name"];
+            new_p.flags |= PICOBIN_PARTITION_FLAGS_HAS_NAME_BITS;
+            if (new_p.name.size() > 127) {
+                fail(ERROR_INCOMPATIBLE, "Partition name \"%s\" is %d characters long - max length is 127 characters\n", new_p.name.c_str(), new_p.name.size());
+            }
+        }
         if (p.contains("id")) {
             if (get_json_int(p["id"], new_p.id)) {new_p.flags |= PICOBIN_PARTITION_FLAGS_HAS_ID_BITS;}
             else {string p_id = p["id"]; fail(ERROR_INCOMPATIBLE, "Partition ID \"%s\" is not a valid 64bit integer\n", p_id.c_str());}
@@ -6083,7 +6607,7 @@ bool partition_create_command::execute(device_map &devices) {
             uint32_t address = settings.offset_set ? settings.offset : FLASH_START;
             auto tmp = std::make_shared<std::stringstream>();
             tmp->write(reinterpret_cast<const char*>(data.data()), data.size());
-            bin2uf2(tmp, out, address, family_id);
+            bin2uf2(tmp, out, address, family_id, models::largest);
         } else {
             out->write(reinterpret_cast<const char*>(data.data()), data.size());
         }
@@ -6110,7 +6634,7 @@ bool partition_create_command::execute(device_map &devices) {
 
 #if HAS_LIBUSB
 bool uf2_info_command::execute(device_map &devices) {
-    auto con = get_single_rp2350_bootsel_device_connection(devices, false);
+    auto con = get_single_picoboot_cmd_compatible_device_connection("uf2 info", devices, {PC_GET_INFO}, false);
     uint32_t buf[5];
     picoboot_get_info_cmd cmd;
     cmd.bType = PICOBOOT_GET_INFO_UF2_STATUS;
@@ -6167,10 +6691,11 @@ bool uf2_convert_command::execute(device_map &devices) {
     }
 
     uint32_t family_id = get_family_id(0);
+    model_t model = get_model(0);
 
     auto in = get_file(ios::in|ios::binary);
     auto out = get_file_idx(ios::out|ios::binary, 1);
-    #if SUPPORT_A2
+    #if SUPPORT_RP2350_A2
     // RP2350-E10 : add absolute block
     if (settings.uf2.abs_block) {
         fos << "RP2350-E10: Adding absolute block to UF2 targeting " << hex_string(settings.uf2.abs_block_loc) << "\n";
@@ -6180,10 +6705,10 @@ bool uf2_convert_command::execute(device_map &devices) {
     #endif
     if (get_file_type() == filetype::elf) {
         uint32_t package_address = settings.offset_set ? settings.offset : 0;
-        elf2uf2(in, out, family_id, package_address, settings.uf2.abs_block_loc);
+        elf2uf2(in, out, family_id, model, package_address, settings.uf2.abs_block_loc, settings.verbose);
     } else if (get_file_type() == filetype::bin) {
         uint32_t address = settings.offset_set ? settings.offset : FLASH_START;
-        bin2uf2(in, out, address, family_id, settings.uf2.abs_block_loc);
+        bin2uf2(in, out, address, family_id, model, settings.uf2.abs_block_loc, settings.verbose);
     } else {
         fail(ERROR_ARGS, "Convert currently only from ELF/BIN to UF2\n");
     }
@@ -6229,9 +6754,18 @@ string gpioxsc(int val) {
     return gpiopxsc(val - 4);
 }
 
-string cpu_reg(int val) {
-    if (val < 0xa) return "r" + std::to_string(val);
+const char *cpu_reg(int val) {
     switch (val) {
+        case 0x0: return "r0";
+        case 0x1: return "r1";
+        case 0x2: return "r2";
+        case 0x3: return "r3";
+        case 0x4: return "r4";
+        case 0x5: return "r5";
+        case 0x6: return "r6";
+        case 0x7: return "r7";
+        case 0x8: return "r8";
+        case 0x9: return "r9";
         case 0xa: return "sl";
         case 0xb: return "fp";
         case 0xc: return "ip";
@@ -6243,672 +6777,679 @@ string cpu_reg(int val) {
     }
 }
 
+bool coprodis_command::decode_line(uint32_t val, char *buf, size_t buf_len) {
+    enum {
+        NONE = 0,
+        MCR = 0x01,
+        MCR2 = 0x02,
+        MRC = 0x04,
+        MRC2 = 0x08,
+        MCRR = 0x10,
+        MCRR2 = 0x20,
+        MRRC = 0x40,
+        MRRC2 = 0x80,
+        CDP = 0x100,
+    } type = NONE;
 
-bool coprodis_command::execute(device_map &devices) {
-    auto in = get_file(ios::in);
+    uint32_t mcrbits = val & 0xff100010;
+    uint32_t mccrbits = (val & 0xfff00000) >> 20;
+    uint32_t cdpbits = val & 0xff000010;
+    const char *inst = "";
 
-    std::stringstream buffer;
-    buffer << in->rdbuf();
-    auto contents = buffer.str();
-
-    std::regex instruction(
-        R"(([ 0-9a-f]{8}):\s*([0-9a-f]{2})(\s*)([0-9a-f]{2})\s+([0-9a-f]{2})\s*([0-9a-f]{2})\s*(.*))"
-    );
-    vector<vector<string>> insts = {};
-    vector<tuple<string,string,string>> proc_insts;
-    while (true)
-    {
-        std::smatch sm;
-        if (!std::regex_search(contents, sm, instruction)) break;
-        vector<string> tmp;
-        std::copy(sm.begin(), sm.end(), std::back_inserter(tmp));
-        insts.push_back(tmp);
-        contents = sm.suffix();
+    switch (mcrbits) {
+        case 0xee000010:
+            type = MCR;
+            inst = "mcr";
+            break;
+        case 0xfe000010:
+            type = MCR2;
+            inst = "mcr2";
+            break;
+        case 0xee100010:
+            type = MRC;
+            inst = "mrc";
+            break;
+        case 0xfe100010:
+            type = MRC2;
+            inst = "mrc2";
+            break;
+        default:
+            break;
     }
 
-    for (vector<string> sm : insts) {
-        uint32_t val;
-        if (sm.size() < 7) {
-            fos << sm[0] << " was too small\n";
-            continue;
-        }
-        if (sm[3].length()) {
-            // Clang
-            int b0, b1, b2, b3 = 0;
-            get_int("0x" + sm[5], b0);
-            get_int("0x" + sm[6], b1);
-            get_int("0x" + sm[2], b2);
-            get_int("0x" + sm[4], b3);
-            val = b0 + (b1 << 8) + (b2 << 16) + (b3 << 24);
-        } else {
-            // GCC
-            int b0, b1 = 0;
-            get_int("0x" + sm[5] + sm[6], b0);
-            get_int("0x" + sm[2] + sm[4], b1);
-            val = b0 + (b1 << 16);
-        }
+    switch (mccrbits) {
+        case 0xec4:
+            type = MCRR;
+            inst = "mcrr";
+            break;
+        case 0xfc4:
+            type = MCRR2;
+            inst = "mcrr2";
+            break;
+        case 0xec5:
+            type = MRRC;
+            inst = "mrrc";
+            break;
+        case 0xfc5:
+            type = MRRC2;
+            inst = "mrrc2";
+            break;
+        default:
+            break;
+    }
 
-        uint32_t mcrbits = val & 0xff100010;
-        bool mcr = false;
-        uint32_t mccrbits = (val & 0xfff00000) >> 20;
-        bool mccr = false;
-        uint32_t cdpbits = val & 0xff000010;
-        bool cdp = false;
-        string inst;
+    switch (cdpbits) {
+        case 0xee000000:
+            type = CDP;
+            inst = "cdp";
+            break;
+        default:
+            break;
+    }
 
-        switch (mcrbits) {
-            case 0xee000010:
-                mcr = true;
-                inst = "mcr";
-                break;
-            case 0xfe000010:
-                mcr = true;
-                inst = "mcr2";
-                break;
-            case 0xee100010:
-                mcr = true;
-                inst = "mrc";
-                break;
-            case 0xfe100010:
-                mcr = true;
-                inst = "mrc2";
-                break;
-            default:
-                break;
-        }
+    if (type & (MCR | MCR2 | MRC | MRC2)) {
+        uint32_t opc1 = (val >> (16+5)) & 0x7u;
+        uint32_t CRn = (val >> 16) & 0xfu;
+        uint32_t Rt = (val >> 12) & 0xfu;
+        uint32_t coproc = (val >> 8) & 0xfu;
+        uint32_t opc2 = (val >> 5) & 0x7u;
+        uint32_t CRm = val & 0xfu;
 
-        switch (mccrbits) {
-            case 0xec4:
-                mccr = true;
-                inst = "mcrr";
-                break;
-            case 0xfc4:
-                mccr = true;
-                inst = "mcrr2";
-                break;
-            case 0xec5:
-                mccr = true;
-                inst = "mrrc";
-                break;
-            case 0xfc5:
-                mccr = true;
-                inst = "mrrc2";
-                break;
-            default:
-                break;
-        }
-
-        switch (cdpbits) {
-            case 0xee000000:
-                cdp = true;
-                inst = "cdp";
-                break;
-            default:
-                break;
-        }
-
-        char rep[512] = "";
-
-        if (mcr) {
-            uint8_t opc1 = (val >> (16+5)) & 0x7;
-            uint8_t CRn = (val >> 16) & 0xf;
-            uint8_t Rt = (val >> 12) & 0xf;
-            uint8_t coproc = (val >> 8) & 0xf;
-            uint8_t opc2 = (val >> 5) & 0x7;
-            uint8_t CRm = val & 0xf;
-
-            if (coproc == 0) {
-                // GPIO
-                if (CRn != 0 || opc1 >= 8) {
+        if (coproc == 0) {
+            // GPIO
+            if (CRn != 0 || opc1 >= 8) {
 //                    fail(ERROR_INCOMPATIBLE,
 //                         "Instruction %s %d, #%d, %s, c%d, c%d, #%d is not supported by GPIO Coprocessor",
-//                         inst.c_str(), coproc, opc1, cpu_reg(Rt).c_str(), CRn, CRm, opc2
+//                         inst.c_str(), coproc, opc1, cpu_reg(Rt), CRn, CRm, opc2
 //                    );
-                    printf("WARNING: Instruction %s %d, #%d, %s, c%d, c%d, #%d is not supported by GPIO Coprocessor\n",
-                         inst.c_str(), coproc, opc1, cpu_reg(Rt).c_str(), CRn, CRm, opc2
-                    );
-                    continue;
-                }
-                if (inst == "mcr") {
-                    if (opc1 < 4) {
-                        snprintf(rep, sizeof(rep), "gpioc_%s_%s %s",
-                            gpiohilo(CRm).c_str(), gpiopxsc(opc1).c_str(), cpu_reg(Rt).c_str()
-                        );
-                    } else {
-                        snprintf(rep, sizeof(rep), "gpioc_%s_%s %s",
-                            gpiodir(CRm).c_str(), gpioxsc(opc1).c_str(), cpu_reg(Rt).c_str()
-                        );
-                    }
-                } else {
-                    snprintf(rep, sizeof(rep), "gpioc_%s_get %s",
-                        gpiohilo(CRm).c_str(), cpu_reg(Rt).c_str()
-                    );
-                }
-            } else if (coproc == 4 || coproc == 5) {
-                // DCP
-                bool ns = coproc == 5;
-                if (inst == "mrc" || inst == "mrc2") {
-                    bool isP = inst == "mrc2";
-                    switch (CRm) {
-                        case 0:
-                            switch (opc2) {
-                                case 0:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%sxvd %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str()
-                                    );
-                                    break;
-                                case 1:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%scmp %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str()
-                                    );
-                                    break;
-                                default:
-                                    continue;
-                            }
-                            break;
-                        case 2:
-                            switch (opc2) {
-                                case 0:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%sdfa %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str()
-                                    );
-                                    break;
-                                case 1:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%sdfs %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str()
-                                    );
-                                    break;
-                                case 2:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%sdfm %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str()
-                                    );
-                                    break;
-                                case 3:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%sdfd %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str()
-                                    );
-                                    break;
-                                case 4:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%sdfq %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str()
-                                    );
-                                    break;
-                                case 5:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%sdfg %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str()
-                                    );
-                                    break;
-                                default:
-                                    continue;
-                            }
-                            break;
-                        case 3:
-                            switch (opc2) {
-                                case 0:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%sdic %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str()
-                                    );
-                                    break;
-                                case 1:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%sduc %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str()
-                                    );
-                                    break;
-                                default:
-                                    continue;
-                            }
-                            break;
-                        default:
-                            continue;
-                    }
-                }
-            } else if (coproc == 7) {
-                // RCP
-                if (inst == "mcr" || inst == "mcr2") {
-                    bool delay = inst == "mcr";
-                    switch (opc1) {
-                        case 0:
-                            snprintf(rep, sizeof(rep), "rcp_canary_check %s, 0x%02x (%d), %sdelay",
-                                cpu_reg(Rt).c_str(), CRn*16 + CRm, CRn*16 + CRm, delay ? "" : "no"
-                            );
-                            break;
-                        case 1:
-                            snprintf(rep, sizeof(rep), "rcp_bvalid %s, %sdelay",
-                                cpu_reg(Rt).c_str(), delay ? "" : "no"
-                            );
-                            break;
-                        case 2:
-                            snprintf(rep, sizeof(rep), "rcp_btrue %s, %sdelay",
-                                cpu_reg(Rt).c_str(), delay ? "" : "no"
-                            );
-                            break;
-                        case 3:
-                            snprintf(rep, sizeof(rep), "rcp_bfalse %s, %sdelay",
-                                cpu_reg(Rt).c_str(), delay ? "" : "no"
-                            );
-                            break;
-                        case 4:
-                            snprintf(rep, sizeof(rep), "rcp_count_set 0x%02x (%d), %sdelay",
-                                CRn*16 + CRm, CRn*16 + CRm, delay ? "" : "no"
-                            );
-                            break;
-                        case 5:
-                            snprintf(rep, sizeof(rep), "rcp_count_check 0x%02x (%d), %sdelay",
-                                CRn*16 + CRm, CRn*16 + CRm, delay ? "" : "no"
-                            );
-                            break;
-                        default:
-                            continue;
-                    }
-                } else {
-                    bool delay = inst == "mrc";
-                    switch (opc1) {
-                        case 0:
-                            snprintf(rep, sizeof(rep), "rcp_canary_get %s, 0x%02x (%d), %sdelay",
-                                cpu_reg(Rt).c_str(), CRn*16 + CRm, CRn*16 + CRm, delay ? "" : "no"
-                            );
-                            break;
-                        case 1:
-                            snprintf(rep, sizeof(rep), "rcp_canary_status %s, %sdelay",
-                                cpu_reg(Rt).c_str(), delay ? "" : "no"
-                            );
-                            break;
-                        default:
-                            continue;
-                    }
-                }
+                printf("WARNING: Instruction %s %d, #%d, %s, c%d, c%d, #%d is not supported by GPIO Coprocessor\n",
+                     inst, coproc, opc1, cpu_reg(Rt), CRn, CRm, opc2
+                );
+                return false;
             }
-        } else if (mccr) {
-            uint8_t Rt2 = (val >> 16) & 0xf;
-            uint8_t Rt = (val >> 12) & 0xf;
-            uint8_t coproc = (val >> 8) & 0xf;
-            uint8_t opc1 = (val >> 4) & 0xf;
-            uint8_t CRm = val & 0xf;
-
-            if (coproc == 0) {
-                // GPIO
-                if (opc1 >= 12) { // || CRm not in [0, 4, 8]):
-//                    fail(ERROR_INCOMPATIBLE,
-//                         "Instruction %s %d, #%d, %s, %s, c%d is not supported by GPIO Coprocessor",
-//                         inst.c_str(), coproc, opc1, cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str(), CRm
-//                    );
-#ifndef NDEBUG
-                    printf("WARNING: Instruction %s %d, #%d, %s, %s, c%d is not supported by GPIO Coprocessor\n",
-                         inst.c_str(), coproc, opc1, cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str(), CRm
+            if (type == MCR) {
+                if (opc1 < 4) {
+                    snprintf(buf, buf_len, "gpioc_%s_%s %s",
+                        gpiohilo(CRm).c_str(), gpiopxsc(opc1).c_str(), cpu_reg(Rt)
                     );
-#endif
-                    continue;
-                }
-                if (inst == "mcrr") {
-                    if (opc1 < 4) {
-                        snprintf(rep, sizeof(rep), "gpioc_hilo_%s_%s %s, %s",
-                            gpiodir(CRm).c_str(), gpiopxsc(opc1).c_str(), cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                        );
-                    } else if (opc1 < 8) {
-                        snprintf(rep, sizeof(rep), "gpioc_bit_%s_%s %s, %s",
-                            gpiodir(CRm).c_str(), gpioxsc2(opc1).c_str(), cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                        );
-                    } else {
-                        snprintf(rep, sizeof(rep), "gpioc_index_%s_%s %s, %s",
-                            gpiodir(CRm).c_str(), gpiopxsc(opc1 - 8).c_str(), cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                        );
-                    }
                 } else {
-                    snprintf(rep, sizeof(rep), "gpioc_index_%s_get %s, %s",
-                        gpiodir(CRm).c_str(), cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
+                    snprintf(buf, buf_len, "gpioc_%s_%s %s",
+                        gpiodir(CRm).c_str(), gpioxsc(opc1).c_str(), cpu_reg(Rt)
                     );
                 }
-            } else if (coproc == 4 || coproc == 5) {
-                // DCP
-                bool ns = coproc == 5;
-                if (inst == "mcrr") {
-                    switch (opc1) {
-                        case 0:
-                            switch (CRm) {
-                                case 0:
-                                    snprintf(rep, sizeof(rep), "dcp%s_wxmd %s, %s",
-                                        ns ? "ns" : "", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                                    );
-                                    break;
-                                case 1:
-                                    snprintf(rep, sizeof(rep), "dcp%s_wymd %s, %s",
-                                        ns ? "ns" : "", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                                    );
-                                    break;
-                                case 2:
-                                    snprintf(rep, sizeof(rep), "dcp%s_wefd %s, %s",
-                                        ns ? "ns" : "", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                                    );
-                                    break;
-                                default:
-                                    continue;
-                            }
-                            break;
-                        case 1:
-                            switch (CRm) {
-                                case 0:
-                                    snprintf(rep, sizeof(rep), "dcp%s_wxup %s, %s",
-                                        ns ? "ns" : "", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                                    );
-                                    break;
-                                case 1:
-                                    snprintf(rep, sizeof(rep), "dcp%s_wyup %s, %s",
-                                        ns ? "ns" : "", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                                    );
-                                    break;
-                                case 2:
-                                    snprintf(rep, sizeof(rep), "dcp%s_wxyu %s, %s",
-                                        ns ? "ns" : "", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                                    );
-                                    break;
-                                default:
-                                    continue;
-                            }
-                            break;
-                        case 2:
-                            snprintf(rep, sizeof(rep), "dcp%s_wxms %s, %s",
-                                ns ? "ns" : "", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                            );
-                            break;
-                        case 3:
-                            snprintf(rep, sizeof(rep), "dcp%s_wxmo %s, %s",
-                                ns ? "ns" : "", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                            );
-                            break;
-                        case 4:
-                            snprintf(rep, sizeof(rep), "dcp%s_wxdd %s, %s",
-                                ns ? "ns" : "", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                            );
-                            break;
-                        case 5:
-                            snprintf(rep, sizeof(rep), "dcp%s_wxdq %s, %s",
-                                ns ? "ns" : "", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                            );
-                            break;
-                        case 6:
-                            snprintf(rep, sizeof(rep), "dcp%s_wxuc %s, %s",
-                                ns ? "ns" : "", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                            );
-                            break;
-                        case 7:
-                            snprintf(rep, sizeof(rep), "dcp%s_wxic %s, %s",
-                                ns ? "ns" : "", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                            );
-                            break;
-                        case 8:
-                            snprintf(rep, sizeof(rep), "dcp%s_wxdc %s, %s",
-                                ns ? "ns" : "", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                            );
-                            break;
-                        case 9:
-                            snprintf(rep, sizeof(rep), "dcp%s_wxfc %s, %s",
-                                ns ? "ns" : "", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                            );
-                            break;
-                        case 10:
-                            snprintf(rep, sizeof(rep), "dcp%s_wxfm %s, %s",
-                                ns ? "ns" : "", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                            );
-                            break;
-                        case 11:
-                            snprintf(rep, sizeof(rep), "dcp%s_wxfd %s, %s",
-                                ns ? "ns" : "", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                            );
-                            break;
-                        case 12:
-                            snprintf(rep, sizeof(rep), "dcp%s_wxfq %s, %s",
-                                ns ? "ns" : "", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                            );
-                            break;
-                        default:
-                            continue;
-                    }
-                } else if (inst == "mrrc" || inst == "mrrc2") {
-                    bool isP = inst == "mrrc2";
-                    switch (CRm) {
-                        case 0:
-                            switch (opc1) {
-                                case 1:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%sdda %s, %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                                    );
-                                    break;
-                                case 3:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%sdds %s, %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                                    );
-                                    break;
-                                case 5:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%sddm %s, %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                                    );
-                                    break;
-                                case 7:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%sddd %s, %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                                    );
-                                    break;
-                                case 9:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%sddq %s, %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                                    );
-                                    break;
-                                case 11:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%sddg %s, %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                                    );
-                                    break;
-                                default:
-                                    continue;
-                            }
-                            break;
-                        case 1:
-                            switch (opc1) {
-                                case 1:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%sxyh %s, %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                                    );
-                                    break;
-                                case 2:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%symr %s, %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                                    );
-                                    break;
-                                case 4:
-                                    snprintf(rep, sizeof(rep), "dcp%s_%sxmq %s, %s",
-                                        ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                                    );
-                                    break;
-                                default:
-                                    continue;
-                            }
-                            break;
-                        case 4:
-                            snprintf(rep, sizeof(rep), "dcp%s_%sxms %s, %s, #0x%01x",
-                                ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str(), opc1
-                            );
-                            break;
-                        case 5:
-                            snprintf(rep, sizeof(rep), "dcp%s_%syms %s, %s, #0x%01x",
-                                ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str(), opc1
-                            );
-                            break;
-                        case 8:
-                            snprintf(rep, sizeof(rep), "dcp%s_%sxmd %s, %s",
-                                ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                            );
-                            break;
-                        case 9:
-                            snprintf(rep, sizeof(rep), "dcp%s_%symd %s, %s",
-                                ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                            );
-                            break;
-                        case 10:
-                            snprintf(rep, sizeof(rep), "dcp%s_%sefd %s, %s",
-                                ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str()
-                            );
-                            break;
-                        default:
-                            continue;
-                    }
-                }
-            } else if (coproc == 7) {
-                // RCP
-                if (inst == "mcrr" || inst == "mcrr2") {
-                    bool delay = inst == "mcrr";
-                    switch (opc1) {
-                        case 0:
-                            snprintf(rep, sizeof(rep), "rcp_b2valid %s, %s, %sdelay",
-                                cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str(), delay ? "" : "no"
-                            );
-                            break;
-                        case 1:
-                            snprintf(rep, sizeof(rep), "rcp_b2and %s, %s, %sdelay",
-                                cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str(), delay ? "" : "no"
-                            );
-                            break;
-                        case 2:
-                            snprintf(rep, sizeof(rep), "rcp_b2or %s, %s, %sdelay",
-                                cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str(), delay ? "" : "no"
-                            );
-                            break;
-                        case 3:
-                            snprintf(rep, sizeof(rep), "rcp_bxorvalid %s, %s, %sdelay",
-                                cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str(), delay ? "" : "no"
-                            );
-                            break;
-                        case 4:
-                            snprintf(rep, sizeof(rep), "rcp_bxortrue %s, %s, %sdelay",
-                                cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str(), delay ? "" : "no"
-                            );
-                            break;
-                        case 5:
-                            snprintf(rep, sizeof(rep), "rcp_bxorfalse %s, %s, %sdelay",
-                                cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str(), delay ? "" : "no"
-                            );
-                            break;
-                        case 6:
-                            snprintf(rep, sizeof(rep), "rcp_ivalid %s, %s, %sdelay",
-                                cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str(), delay ? "" : "no"
-                            );
-                            break;
-                        case 7:
-                            snprintf(rep, sizeof(rep), "rcp_iequal %s, %s, %sdelay",
-                                cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str(), delay ? "" : "no"
-                            );
-                            break;
-                        case 8:
-                            snprintf(rep, sizeof(rep), "rcp_salt_core%d %s, %s, %sdelay",
-                                CRm, cpu_reg(Rt).c_str(), cpu_reg(Rt2).c_str(), delay ? "" : "no"
-                            );
-                            break;
-                        default:
-                            continue;
-                    }
-                }
+            } else {
+                snprintf(buf, buf_len, "gpioc_%s_get %s",
+                    gpiohilo(CRm).c_str(), cpu_reg(Rt)
+                );
             }
-        } else if (cdp) {
-            uint8_t opc1 = (val >> 20) & 0xf;
-            uint8_t CRn = (val >> 16) & 0xf;
-            uint8_t CRd = (val >> 12) & 0xf;
-            uint8_t coproc = (val >> 8) & 0xf;
-            uint8_t opc2 = (val >> 5) & 0x7;
-            uint8_t CRm = val & 0xf;
-
-            if (coproc == 0) {
-                // GPIO has no cdp instructions
-                continue;
-            } else if (coproc == 4|| coproc == 5) {
-                // DCP
-                bool ns = coproc == 5;
-                switch (opc1) {
+        } else if (coproc == 4 || coproc == 5) {
+            // DCP
+            bool ns = coproc == 5;
+            if (type & (MRC | MRC2)) {
+                bool isP = type == MRC2;
+                switch (CRm) {
                     case 0:
-                        if (CRm == 0) {
-                            snprintf(rep, sizeof(rep), "dcp%s_init", ns ? "ns" : "");
-                        } else {
-                            snprintf(rep, sizeof(rep), "dcp%s_add0", ns ? "ns" : "");
-                        }
-                        break;
-                    case 1:
-                        if (opc2 == 0) {
-                            snprintf(rep, sizeof(rep), "dcp%s_add1", ns ? "ns" : "");
-                        } else {
-                            snprintf(rep, sizeof(rep), "dcp%s_sub1", ns ? "ns" : "");
+                        switch (opc2) {
+                            case 0:
+                                snprintf(buf, buf_len, "dcp%s_%sxvd %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt)
+                                );
+                                break;
+                            case 1:
+                                snprintf(buf, buf_len, "dcp%s_%scmp %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt)
+                                );
+                                break;
+                            default:
+                                return false;
                         }
                         break;
                     case 2:
-                        snprintf(rep, sizeof(rep), "dcp%s_sqr0", ns ? "ns" : "");
+                        switch (opc2) {
+                            case 0:
+                                snprintf(buf, buf_len, "dcp%s_%sdfa %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt)
+                                );
+                                break;
+                            case 1:
+                                snprintf(buf, buf_len, "dcp%s_%sdfs %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt)
+                                );
+                                break;
+                            case 2:
+                                snprintf(buf, buf_len, "dcp%s_%sdfm %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt)
+                                );
+                                break;
+                            case 3:
+                                snprintf(buf, buf_len, "dcp%s_%sdfd %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt)
+                                );
+                                break;
+                            case 4:
+                                snprintf(buf, buf_len, "dcp%s_%sdfq %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt)
+                                );
+                                break;
+                            case 5:
+                                snprintf(buf, buf_len, "dcp%s_%sdfg %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt)
+                                );
+                                break;
+                            default:
+                                return false;
+                        }
                         break;
-                    case 8:
-                        if (CRm == 2 && opc2 == 0) {
-                            snprintf(rep, sizeof(rep), "dcp%s_norm", ns ? "ns" : "");
-                        } else if (CRm == 2 && opc2 == 1) {
-                            snprintf(rep, sizeof(rep), "dcp%s_nrdf", ns ? "ns" : "");
-                        } else if (CRm == 0 && opc2 == 1) {
-                            snprintf(rep, sizeof(rep), "dcp%s_nrdd", ns ? "ns" : "");
-                        } else if (CRm == 0 && opc2 == 2) {
-                            snprintf(rep, sizeof(rep), "dcp%s_ntdc", ns ? "ns" : "");
-                        } else if (CRm == 0 && opc2 == 3) {
-                            snprintf(rep, sizeof(rep), "dcp%s_nrdc", ns ? "ns" : "");
-                        } else {
-                            continue;
+                    case 3:
+                        switch (opc2) {
+                            case 0:
+                                snprintf(buf, buf_len, "dcp%s_%sdic %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt)
+                                );
+                                break;
+                            case 1:
+                                snprintf(buf, buf_len, "dcp%s_%sduc %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt)
+                                );
+                                break;
+                            default:
+                                return false;
                         }
                         break;
                     default:
-                        continue;
-                }
-            } else if (coproc == 7) {
-                // RCP
-                if (opc1 == 0 && CRd == 0 && CRn == 0 && CRm == 0) {
-                    snprintf(rep, sizeof(rep), "rcp_panic");
-                } else {
-                    continue;
+                        return false;
                 }
             }
-        } else {
-            continue;
+        } else if (coproc == 7) {
+            // RCP
+            if (type & (MCR | MCR2)) {
+                bool delay = type == MCR;
+                switch (opc1) {
+                    case 0:
+                        snprintf(buf, buf_len, "rcp_canary_check %s, 0x%02x (%d), %sdelay",
+                            cpu_reg(Rt), CRn*16 + CRm, CRn*16 + CRm, delay ? "" : "no"
+                        );
+                        break;
+                    case 1:
+                        snprintf(buf, buf_len, "rcp_bvalid %s, %sdelay",
+                            cpu_reg(Rt), delay ? "" : "no"
+                        );
+                        break;
+                    case 2:
+                        snprintf(buf, buf_len, "rcp_btrue %s, %sdelay",
+                            cpu_reg(Rt), delay ? "" : "no"
+                        );
+                        break;
+                    case 3:
+                        snprintf(buf, buf_len, "rcp_bfalse %s, %sdelay",
+                            cpu_reg(Rt), delay ? "" : "no"
+                        );
+                        break;
+                    case 4:
+                        snprintf(buf, buf_len, "rcp_count_set 0x%02x (%d), %sdelay",
+                            CRn*16 + CRm, CRn*16 + CRm, delay ? "" : "no"
+                        );
+                        break;
+                    case 5:
+                        snprintf(buf, buf_len, "rcp_count_check 0x%02x (%d), %sdelay",
+                            CRn*16 + CRm, CRn*16 + CRm, delay ? "" : "no"
+                        );
+                        break;
+                    default:
+                        return false;
+                }
+            } else {
+                bool delay = type == MRC;
+                switch (opc1) {
+                    case 0:
+                        snprintf(buf, buf_len, "rcp_canary_get %s, 0x%02x (%d), %sdelay",
+                            cpu_reg(Rt), CRn*16 + CRm, CRn*16 + CRm, delay ? "" : "no"
+                        );
+                        break;
+                    case 1:
+                        snprintf(buf, buf_len, "rcp_canary_status %s, %sdelay",
+                            cpu_reg(Rt), delay ? "" : "no"
+                        );
+                        break;
+                    default:
+                        return false;
+                }
+            }
         }
+    } else if (type & (MCRR | MCRR2 | MRRC | MRRC2)) {
+        uint32_t Rt2 = (val >> 16) & 0xfu;
+        uint32_t Rt = (val >> 12) & 0xfu;
+        uint32_t coproc = (val >> 8) & 0xfu;
+        uint32_t opc1 = (val >> 4) & 0xfu;
+        uint32_t CRm = val & 0xfu;
 
-        if (strlen(rep) > 0) {
-            tuple<string,string,string> proc = {sm.front(), sm.back(), rep};
-            proc_insts.push_back(proc);
+        if (coproc == 0) {
+            // GPIO
+            if (opc1 >= 12) { // || CRm not in [0, 4, 8]):
+//                    fail(ERROR_INCOMPATIBLE,
+//                         "Instruction %s %d, #%d, %s, %s, c%d is not supported by GPIO Coprocessor",
+//                         inst.c_str(), coproc, opc1, cpu_reg(Rt), cpu_reg(Rt2), CRm
+//                    );
+#ifndef NDEBUG
+                printf("WARNING: Instruction %s %d, #%d, %s, %s, c%d is not supported by GPIO Coprocessor\n",
+                     inst, coproc, opc1, cpu_reg(Rt), cpu_reg(Rt2), CRm
+                );
+#endif
+                return false;
+            }
+            if (type == MCRR) {
+                if (opc1 < 4) {
+                    snprintf(buf, buf_len, "gpioc_hilo_%s_%s %s, %s",
+                        gpiodir(CRm).c_str(), gpiopxsc(opc1).c_str(), cpu_reg(Rt), cpu_reg(Rt2)
+                    );
+                } else if (opc1 < 8) {
+                    snprintf(buf, buf_len, "gpioc_bit_%s_%s %s, %s",
+                        gpiodir(CRm).c_str(), gpioxsc2(opc1).c_str(), cpu_reg(Rt), cpu_reg(Rt2)
+                    );
+                } else {
+                    snprintf(buf, buf_len, "gpioc_index_%s_%s %s, %s",
+                        gpiodir(CRm).c_str(), gpiopxsc(opc1 - 8).c_str(), cpu_reg(Rt), cpu_reg(Rt2)
+                    );
+                }
+            } else {
+                snprintf(buf, buf_len, "gpioc_index_%s_get %s, %s",
+                    gpiodir(CRm).c_str(), cpu_reg(Rt), cpu_reg(Rt2)
+                );
+            }
+        } else if (coproc == 4 || coproc == 5) {
+            // DCP
+            bool ns = coproc == 5;
+            if (type == MCRR) {
+                switch (opc1) {
+                    case 0:
+                        switch (CRm) {
+                            case 0:
+                                snprintf(buf, buf_len, "dcp%s_wxmd %s, %s",
+                                    ns ? "ns" : "", cpu_reg(Rt), cpu_reg(Rt2)
+                                );
+                                break;
+                            case 1:
+                                snprintf(buf, buf_len, "dcp%s_wymd %s, %s",
+                                    ns ? "ns" : "", cpu_reg(Rt), cpu_reg(Rt2)
+                                );
+                                break;
+                            case 2:
+                                snprintf(buf, buf_len, "dcp%s_wefd %s, %s",
+                                    ns ? "ns" : "", cpu_reg(Rt), cpu_reg(Rt2)
+                                );
+                                break;
+                            default:
+                                return false;
+                        }
+                        break;
+                    case 1:
+                        switch (CRm) {
+                            case 0:
+                                snprintf(buf, buf_len, "dcp%s_wxup %s, %s",
+                                    ns ? "ns" : "", cpu_reg(Rt), cpu_reg(Rt2)
+                                );
+                                break;
+                            case 1:
+                                snprintf(buf, buf_len, "dcp%s_wyup %s, %s",
+                                    ns ? "ns" : "", cpu_reg(Rt), cpu_reg(Rt2)
+                                );
+                                break;
+                            case 2:
+                                snprintf(buf, buf_len, "dcp%s_wxyu %s, %s",
+                                    ns ? "ns" : "", cpu_reg(Rt), cpu_reg(Rt2)
+                                );
+                                break;
+                            default:
+                                return false;
+                        }
+                        break;
+                    case 2:
+                        snprintf(buf, buf_len, "dcp%s_wxms %s, %s",
+                            ns ? "ns" : "", cpu_reg(Rt), cpu_reg(Rt2)
+                        );
+                        break;
+                    case 3:
+                        snprintf(buf, buf_len, "dcp%s_wxmo %s, %s",
+                            ns ? "ns" : "", cpu_reg(Rt), cpu_reg(Rt2)
+                        );
+                        break;
+                    case 4:
+                        snprintf(buf, buf_len, "dcp%s_wxdd %s, %s",
+                            ns ? "ns" : "", cpu_reg(Rt), cpu_reg(Rt2)
+                        );
+                        break;
+                    case 5:
+                        snprintf(buf, buf_len, "dcp%s_wxdq %s, %s",
+                            ns ? "ns" : "", cpu_reg(Rt), cpu_reg(Rt2)
+                        );
+                        break;
+                    case 6:
+                        snprintf(buf, buf_len, "dcp%s_wxuc %s, %s",
+                            ns ? "ns" : "", cpu_reg(Rt), cpu_reg(Rt2)
+                        );
+                        break;
+                    case 7:
+                        snprintf(buf, buf_len, "dcp%s_wxic %s, %s",
+                            ns ? "ns" : "", cpu_reg(Rt), cpu_reg(Rt2)
+                        );
+                        break;
+                    case 8:
+                        snprintf(buf, buf_len, "dcp%s_wxdc %s, %s",
+                            ns ? "ns" : "", cpu_reg(Rt), cpu_reg(Rt2)
+                        );
+                        break;
+                    case 9:
+                        snprintf(buf, buf_len, "dcp%s_wxfc %s, %s",
+                            ns ? "ns" : "", cpu_reg(Rt), cpu_reg(Rt2)
+                        );
+                        break;
+                    case 10:
+                        snprintf(buf, buf_len, "dcp%s_wxfm %s, %s",
+                            ns ? "ns" : "", cpu_reg(Rt), cpu_reg(Rt2)
+                        );
+                        break;
+                    case 11:
+                        snprintf(buf, buf_len, "dcp%s_wxfd %s, %s",
+                            ns ? "ns" : "", cpu_reg(Rt), cpu_reg(Rt2)
+                        );
+                        break;
+                    case 12:
+                        snprintf(buf, buf_len, "dcp%s_wxfq %s, %s",
+                            ns ? "ns" : "", cpu_reg(Rt), cpu_reg(Rt2)
+                        );
+                        break;
+                    default:
+                        return false;
+                }
+            } else if (type & (MRRC | MRRC2)) {
+                bool isP = type == MRRC2;
+                switch (CRm) {
+                    case 0:
+                        switch (opc1) {
+                            case 1:
+                                snprintf(buf, buf_len, "dcp%s_%sdda %s, %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt), cpu_reg(Rt2)
+                                );
+                                break;
+                            case 3:
+                                snprintf(buf, buf_len, "dcp%s_%sdds %s, %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt), cpu_reg(Rt2)
+                                );
+                                break;
+                            case 5:
+                                snprintf(buf, buf_len, "dcp%s_%sddm %s, %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt), cpu_reg(Rt2)
+                                );
+                                break;
+                            case 7:
+                                snprintf(buf, buf_len, "dcp%s_%sddd %s, %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt), cpu_reg(Rt2)
+                                );
+                                break;
+                            case 9:
+                                snprintf(buf, buf_len, "dcp%s_%sddq %s, %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt), cpu_reg(Rt2)
+                                );
+                                break;
+                            case 11:
+                                snprintf(buf, buf_len, "dcp%s_%sddg %s, %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt), cpu_reg(Rt2)
+                                );
+                                break;
+                            default:
+                                return false;
+                        }
+                        break;
+                    case 1:
+                        switch (opc1) {
+                            case 1:
+                                snprintf(buf, buf_len, "dcp%s_%sxyh %s, %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt), cpu_reg(Rt2)
+                                );
+                                break;
+                            case 2:
+                                snprintf(buf, buf_len, "dcp%s_%symr %s, %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt), cpu_reg(Rt2)
+                                );
+                                break;
+                            case 4:
+                                snprintf(buf, buf_len, "dcp%s_%sxmq %s, %s",
+                                    ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt), cpu_reg(Rt2)
+                                );
+                                break;
+                            default:
+                                return false;
+                        }
+                        break;
+                    case 4:
+                        snprintf(buf, buf_len, "dcp%s_%sxms %s, %s, #0x%01x",
+                            ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt), cpu_reg(Rt2), opc1
+                        );
+                        break;
+                    case 5:
+                        snprintf(buf, buf_len, "dcp%s_%syms %s, %s, #0x%01x",
+                            ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt), cpu_reg(Rt2), opc1
+                        );
+                        break;
+                    case 8:
+                        snprintf(buf, buf_len, "dcp%s_%sxmd %s, %s",
+                            ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt), cpu_reg(Rt2)
+                        );
+                        break;
+                    case 9:
+                        snprintf(buf, buf_len, "dcp%s_%symd %s, %s",
+                            ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt), cpu_reg(Rt2)
+                        );
+                        break;
+                    case 10:
+                        snprintf(buf, buf_len, "dcp%s_%sefd %s, %s",
+                            ns ? "ns" : "", isP ? "p" : "r", cpu_reg(Rt), cpu_reg(Rt2)
+                        );
+                        break;
+                    default:
+                        return false;
+                }
+            }
+        } else if (coproc == 7) {
+            // RCP
+            if (type & (MCRR | MCRR2)) {
+                bool delay = type == MCRR;
+                switch (opc1) {
+                    case 0:
+                        snprintf(buf, buf_len, "rcp_b2valid %s, %s, %sdelay",
+                            cpu_reg(Rt), cpu_reg(Rt2), delay ? "" : "no"
+                        );
+                        break;
+                    case 1:
+                        snprintf(buf, buf_len, "rcp_b2and %s, %s, %sdelay",
+                            cpu_reg(Rt), cpu_reg(Rt2), delay ? "" : "no"
+                        );
+                        break;
+                    case 2:
+                        snprintf(buf, buf_len, "rcp_b2or %s, %s, %sdelay",
+                            cpu_reg(Rt), cpu_reg(Rt2), delay ? "" : "no"
+                        );
+                        break;
+                    case 3:
+                        snprintf(buf, buf_len, "rcp_bxorvalid %s, %s, %sdelay",
+                            cpu_reg(Rt), cpu_reg(Rt2), delay ? "" : "no"
+                        );
+                        break;
+                    case 4:
+                        snprintf(buf, buf_len, "rcp_bxortrue %s, %s, %sdelay",
+                            cpu_reg(Rt), cpu_reg(Rt2), delay ? "" : "no"
+                        );
+                        break;
+                    case 5:
+                        snprintf(buf, buf_len, "rcp_bxorfalse %s, %s, %sdelay",
+                            cpu_reg(Rt), cpu_reg(Rt2), delay ? "" : "no"
+                        );
+                        break;
+                    case 6:
+                        snprintf(buf, buf_len, "rcp_ivalid %s, %s, %sdelay",
+                            cpu_reg(Rt), cpu_reg(Rt2), delay ? "" : "no"
+                        );
+                        break;
+                    case 7:
+                        snprintf(buf, buf_len, "rcp_iequal %s, %s, %sdelay",
+                            cpu_reg(Rt), cpu_reg(Rt2), delay ? "" : "no"
+                        );
+                        break;
+                    case 8:
+                        snprintf(buf, buf_len, "rcp_salt_core%d %s, %s, %sdelay",
+                            CRm, cpu_reg(Rt), cpu_reg(Rt2), delay ? "" : "no"
+                        );
+                        break;
+                    default:
+                        return false;
+                }
+            }
         }
+    } else if (type == CDP) {
+        uint8_t opc1 = (val >> 20) & 0xf;
+        uint8_t CRn = (val >> 16) & 0xf;
+        uint8_t CRd = (val >> 12) & 0xf;
+        uint8_t coproc = (val >> 8) & 0xf;
+        uint8_t opc2 = (val >> 5) & 0x7;
+        uint8_t CRm = val & 0xf;
+
+        if (coproc == 0) {
+            // GPIO has no cdp instructions
+            return false;
+        } else if (coproc == 4|| coproc == 5) {
+            // DCP
+            bool ns = coproc == 5;
+            switch (opc1) {
+                case 0:
+                    if (CRm == 0) {
+                        snprintf(buf, buf_len, "dcp%s_init", ns ? "ns" : "");
+                    } else {
+                        snprintf(buf, buf_len, "dcp%s_add0", ns ? "ns" : "");
+                    }
+                break;
+                case 1:
+                    if (opc2 == 0) {
+                        snprintf(buf, buf_len, "dcp%s_add1", ns ? "ns" : "");
+                    } else {
+                        snprintf(buf, buf_len, "dcp%s_sub1", ns ? "ns" : "");
+                    }
+                break;
+                case 2:
+                    snprintf(buf, buf_len, "dcp%s_sqr0", ns ? "ns" : "");
+                break;
+                case 8:
+                    if (CRm == 2 && opc2 == 0) {
+                        snprintf(buf, buf_len, "dcp%s_norm", ns ? "ns" : "");
+                    } else if (CRm == 2 && opc2 == 1) {
+                        snprintf(buf, buf_len, "dcp%s_nrdf", ns ? "ns" : "");
+                    } else if (CRm == 0 && opc2 == 1) {
+                        snprintf(buf, buf_len, "dcp%s_nrdd", ns ? "ns" : "");
+                    } else if (CRm == 0 && opc2 == 2) {
+                        snprintf(buf, buf_len, "dcp%s_ntdc", ns ? "ns" : "");
+                    } else if (CRm == 0 && opc2 == 3) {
+                        snprintf(buf, buf_len, "dcp%s_nrdc", ns ? "ns" : "");
+                    } else {
+                        return false;
+                    }
+                break;
+                default:
+                    return false;
+            }
+        } else if (coproc == 7) {
+            // RCP
+            if (opc1 == 0 && CRd == 0 && CRn == 0 && CRm == 0) {
+                snprintf(buf, buf_len, "rcp_panic");
+            } else {
+                return false;
+            }
+        }
+    } else {
+        return false;
     }
+    return true;
+}
+
+bool coprodis_command::execute(device_map &devices) {
+    auto in = get_file(ios::in);
+    std::stringstream buffer;
+    buffer << in->rdbuf();
 
     auto out = get_file_idx(ios::out, 1);
 
-    if (proc_insts.size() == 0) {
-        *out << buffer.str();
-        return false;
-    }
-
     string line;
-    fos << "Replacing " << proc_insts.size() << " instructions\n";
-    while (getline(buffer, line)) {
-        if (!proc_insts.empty() && line == std::get<0>(proc_insts[0])) {
-            fos << "\nFound instruction\n";
-            fos << line;
-            fos << "\n";
+    static char buf[512];
+    buf[sizeof(buf)-1] = 0;
+    std::smatch sm;
+    while (std::getline(buffer, line)) {
+        size_t len = line.length();
+        bool replaced = false;
+        auto consume_whitespace = [&](size_t &pos) {
+            while (pos < len) {
+                char c = line[pos];
+                if (c != ' ' && c !='\t') break;
+                pos++;
+            }
+        };
+        auto consume_hex = [&](size_t &pos, uint32_t& val) {
+            val = 0;
+            size_t pos0 = pos;
+            while (pos < len) {
+                char c = line[pos];
+                if (c >= '0' && c <= '9') val = (val << 4) | (c - '0');
+                else if (c >= 'a' && c <= 'f') val = (val << 4) | (c + 10 - 'a');
+                else if (c >= 'A' && c <= 'F') val = (val << 4) | (c + 10 - 'A');
+                else break;
+                pos++;
+            }
+            return pos - pos0;
+        };
 
-            string olds = std::get<1>(proc_insts[0]);
-            string news = std::get<2>(proc_insts[0]);
-
-            line.replace(line.find(olds), olds.length(), news);
-            fos << "Replaced with\n";
-            fos << line;
-            fos << "\n";
-            proc_insts.erase(proc_insts.begin());
+        size_t pos = 0;
+        do {
+            // regex is too slow on some platforms, so hand code
+            if (len < 16 || len >= sizeof(buf) || line[8]!=':') break;
+            uint32_t val;
+            consume_whitespace(pos);
+            consume_hex(pos, val);
+            if (pos != 8) break;
+            pos = 9;
+            consume_whitespace(pos);
+            // note we only care about 32 bit instructions
+            uint32_t instr, tmp;
+            size_t first_hex_size = consume_hex(pos, instr);
+            if (first_hex_size == 2) {
+                // some clang have LL HH ll hh
+                consume_whitespace(pos);
+                if (2 != consume_hex(pos, tmp)) break;
+                instr |= (tmp << 8u);
+                consume_whitespace(pos);
+                if (2 != consume_hex(pos, tmp)) break;
+                instr = (instr << 16) | tmp;
+                consume_whitespace(pos);
+                if (2 != consume_hex(pos, tmp)) break;
+                instr |= (tmp << 8u);
+            } else if (first_hex_size == 4) {
+                // GCC has HHLL hhll
+                consume_whitespace(pos);
+                if (4 != consume_hex(pos, tmp)) break;
+                instr = (instr << 16) | tmp;
+            } else {
+                break;
+            }
+            consume_whitespace(pos);
+            if (pos < sizeof(buf)-1) {
+                strncpy(buf, line.c_str(), sizeof(buf)-1);
+                replaced = decode_line(instr, buf + pos, sizeof(buf) - pos - 1);
+            }
+        } while (false);
+        if (replaced) {
+            *out << buf << "\n";
+        } else {
+            *out << line << "\n";
         }
-        *out << line << "\n";
     }
-
-    for (auto v : proc_insts) {
-        fos << std::get<0>(v) + " : "  + std::get<1>(v) + " : " + std::get<2>(v) + "\n\n\n";
-    }
-
     return false;
 }
-
 
 #if HAS_LIBUSB
 static void check_otp_write_error(picoboot::command_failure &e, bool ecc) {
@@ -6918,172 +7459,489 @@ static void check_otp_write_error(picoboot::command_failure &e, bool ecc) {
     }
 }
 
+bool settings_select_ecc(void) {
+    return settings.otp.ecc && !settings.otp.raw;
+}
+
+uint8_t otp_cmd_max_bits(void) {
+    return settings_select_ecc() ? 16 : 24;
+}
+
+typedef std::function<void(uint8_t *buffer, uint32_t len, picoboot_otp_cmd &otp_cmd)> otp_read_func_t;
+typedef std::function<void(uint8_t *buffer, uint32_t len, picoboot_otp_cmd &otp_cmd)> otp_write_func_t;
+void process_otp_json(json &otp_json, model_t model, otp_read_func_t read_func, otp_write_func_t write_func) {
+    int raw_max_bits = 24;
+    for (auto row : otp_json.items()) {
+        fos.first_column(0);
+        string row_key = row.key();
+        auto row_value = row.value();
+        fos << row_key << ":\n";
+
+        // Find matching OTP row
+        bool is_sequence = false;
+        auto row_matches = filter_otp({row_key}, raw_max_bits, true);
+        if (row_matches.empty()) {
+            fail(ERROR_INCOMPATIBLE, "%s does not match an otp row", row_key.c_str());
+        } else if (row_matches.size() != 1) {
+            // Check if it is a sequence
+            auto row_seq0_matches = filter_otp({row_key + "0"}, raw_max_bits, false);
+            auto row_seq_0_matches = filter_otp({row_key + "_0"}, raw_max_bits, false);
+            if (row_seq0_matches.size() == 1) {
+                row_matches = row_seq0_matches;
+            } else if (row_seq_0_matches.size() == 1) {
+                row_matches = row_seq_0_matches;
+            }
+            else if (row_matches.size() != (*row_matches.begin()).second.reg->seq_length) {
+                for (auto x : row_matches) {
+                    DEBUG_LOG("Matches %s\n", x.second.reg->name.c_str());
+                }
+                fail(ERROR_INCOMPATIBLE, "%s matches multiple otp rows or sequences", row_key.c_str());
+            }
+            is_sequence = true;
+        }
+        auto row_match = *row_matches.begin();
+        auto reg = row_match.second.reg;
+        vector<uint8_t> data;
+        struct picoboot_otp_cmd otp_cmd;
+        int hex_val = 0;
+        unsigned int row_size = 0;
+
+        fos.first_column(2);
+
+        if (reg != nullptr) {
+            otp_cmd.wRow = row_match.second.reg_row;
+            otp_cmd.wRowCount = is_sequence ? reg->seq_length : (reg->redundancy ? reg->redundancy : 1);
+            otp_cmd.bEcc = reg->ecc;
+            row_size = otp_cmd.bEcc ? 2 : 4;
+
+            // Calculate row value
+            if (row_value.is_object()) {
+                // Specified fields
+                struct picoboot_otp_cmd tmp_otp_cmd = otp_cmd;
+                tmp_otp_cmd.wRowCount = 1;
+                tmp_otp_cmd.bEcc = 0;
+                uint32_t old_raw_value;
+                read_func((uint8_t*)&old_raw_value, sizeof(old_raw_value), tmp_otp_cmd);
+
+                uint32_t reg_value = 0;
+                uint32_t full_mask = 0;
+                for (auto field_val : row_value.items()) {
+                    string key = field_val.key();
+                    auto value = field_val.value();
+                    if (!get_json_int(value, hex_val)) {
+                        fail(ERROR_FORMAT, "Values must be integers");
+                    }
+
+                    // Find matching OTP field
+                    auto field_matches = filter_otp({row_key + "." + key}, raw_max_bits, false);
+                    if (field_matches.size() != 1) {
+                        fail(ERROR_INCOMPATIBLE, "%s is not a single otp field", key.c_str());
+                    }
+                    auto field_match = *field_matches.begin();
+                    auto field = field_match.second.field;
+
+                    fos << key << ": " << hex_string(hex_val) << "\n";
+
+                    int low = __builtin_ctz(field->mask);
+
+                    if (hex_val & (~field->mask >> low)) {
+                        fail(ERROR_NOT_POSSIBLE, "Value to set does not fit in field: value %06x, mask %06x\n", hex_val, field->mask >> low);
+                    }
+
+                    hex_val <<= low;
+                    hex_val &= field->mask;
+                    full_mask |= field->mask;
+                    reg_value |= hex_val;
+                }
+                reg_value |= old_raw_value & ~full_mask;
+                vector<uint8_t> tmp((uint8_t*)(&reg_value), (uint8_t*)(&reg_value) + row_size);
+                data.insert(data.begin(), tmp.begin(), tmp.end());
+            } else if (row_value.is_array()) {
+                for (auto val : row_value)  {
+                    if (!get_json_int(val, hex_val)) {
+                        fail(ERROR_FORMAT, "Values must be integers");
+                    }
+                    fos << hex_string(hex_val, 2) << ", ";
+                    data.push_back(hex_val);
+                }
+                fos << "\n";
+            } else {
+                if (!get_json_int(row_value, hex_val)) {
+                    fail(ERROR_FORMAT, "Values must be integers");
+                }
+                fos << hex_string(hex_val) << "\n";
+                vector<uint8_t> tmp((uint8_t*)(&hex_val), (uint8_t*)(&hex_val) + row_size);
+                data.insert(data.begin(), tmp.begin(), tmp.end());
+            }
+        } else {
+            // Must be a raw address
+            otp_cmd.wRow = row_match.second.reg_row;
+            otp_cmd.wRowCount = 1;
+            otp_cmd.bEcc = row_value["ecc"].is_boolean() ? (bool)row_value["ecc"] : false;
+            row_size = otp_cmd.bEcc ? 2 : 4;
+
+            auto val = row_value["value"];
+            if (val.is_array()) {
+                for (auto v : val)  {
+                    if (!get_json_int(v, hex_val)) {
+                        fail(ERROR_FORMAT, "Values must be integers");
+                    }
+                    fos << hex_string(hex_val, 2) << ", ";
+                    data.push_back(hex_val);
+                }
+                fos << "\n";
+                otp_cmd.wRowCount = data.size() / row_size;
+            } else {
+                if (!get_json_int(val, hex_val)) {
+                    fail(ERROR_FORMAT, "Values must be integers");
+                }
+                fos << hex_string(hex_val) << "\n";
+                vector<uint8_t> tmp((uint8_t*)(&hex_val), (uint8_t*)(&hex_val) + row_size);
+                data.insert(data.begin(), tmp.begin(), tmp.end());
+                if (get_json_int(row_value["redundancy"], hex_val)) otp_cmd.wRowCount = hex_val;
+            }
+        }
+
+        if (data.size() % row_size) {
+            fail(ERROR_FORMAT, "Data size must be a multiple of selected row data size (%d)", row_size);
+        }
+        if (data.size() == row_size && otp_cmd.wRowCount > 1) {
+            // Repeat the data for each redundant row
+            data.resize(otp_cmd.wRowCount * row_size);
+            for (int i=1; i < otp_cmd.wRowCount; i++) std::copy_n(data.begin(), row_size, data.begin() + row_size*i);
+        }
+
+        if (data.size() != row_size * otp_cmd.wRowCount) {
+            fail(ERROR_FORMAT, "Data size must be selected row data size * row count (%d*%d)", row_size, otp_cmd.wRowCount);
+        }
+
+        write_func(data.data(), data.size(), otp_cmd);
+    }
+}
+
+static void hack_init_otp_regs() {
+    // build map of OTP regs by offset
+    if (settings.otp.extra_files.size() > 0) {
+        DEBUG_LOG("Using extra OTP files:\n");
+        for (auto file : settings.otp.extra_files) {
+            DEBUG_LOG("%s\n", file.c_str());
+        }
+    }
+    init_otp(otp_regs, settings.otp.extra_files);
+}
+
+
+bool otp_get_command::execute(device_map &devices) {
+    auto con = get_single_picoboot_cmd_compatible_device_connection("otp get", devices, {PC_OTP_READ}, false);
+    hack_init_otp_regs();
+    picoboot_memory_access raw_access(con);
+    auto model = raw_access.get_model();
+    auto matches = filter_otp(settings.otp.selectors, otp_cmd_max_bits(), settings.otp.fuzzy);
+    uint32_t last_reg_row = 1; // invalid
+    bool first = true;
+    char buf[512];
+    uint32_t raw_buffer[OTP_PAGE_ROWS];
+    memset(raw_buffer, 0xaa, sizeof(raw_buffer));
+    int indent0 = settings.otp.list_pages ? 18 : 8;
+    uint32_t last_page = -1;
+    for (const auto& e : matches) {
+        const auto &m = e.second;
+        bool do_ecc = settings.otp.ecc;
+        int redundancy = settings.otp.redundancy;
+        uint32_t corrected_val = 0;
+        if (m.reg_row / OTP_PAGE_ROWS != last_page) {
+            // todo pre-check page lock
+            struct picoboot_otp_cmd otp_cmd;
+            if (m.reg_row / OTP_PAGE_ROWS >= OTP_PAGE_COUNT - OTP_SPECIAL_PAGES) {
+                // Read individual rows for lock words
+                otp_cmd.wRow = m.reg_row;
+                otp_cmd.wRowCount = 1;
+                otp_cmd.bEcc = 0;
+                con.otp_read(&otp_cmd, (uint8_t *)&(raw_buffer[m.reg_row % OTP_PAGE_ROWS]), sizeof(raw_buffer[0]));
+            } else {
+                // Otherwise read a page at a time
+                last_page = m.reg_row / OTP_PAGE_ROWS;
+                otp_cmd.wRow = last_page * OTP_PAGE_ROWS;
+                otp_cmd.wRowCount = OTP_PAGE_ROWS;
+                otp_cmd.bEcc = 0;
+                con.otp_read(&otp_cmd, (uint8_t *)raw_buffer, sizeof(raw_buffer));
+            }
+        }
+        if (m.reg_row != last_reg_row) {
+            last_reg_row = m.reg_row;
+            // Write out header for row
+            fos.first_column(0);
+            if (!first) fos.wrap_hard();
+            first = false;
+            fos.hanging_indent(7);
+            snprintf(buf, sizeof(buf), "ROW 0x%04x", m.reg_row);
+            fos << buf;
+            if (settings.otp.list_pages) {
+                snprintf(buf, sizeof(buf), " (0x%02x:0x%02x)", m.reg_row / OTP_PAGE_ROWS,
+                         m.reg_row % OTP_PAGE_ROWS);
+                fos << buf;
+            }
+            if (m.reg) {
+                fos << ": " << m.reg->name;
+                if (settings.otp.list_no_descriptions) {
+                    if (m.reg->ecc) {
+                        fos << " (ECC)";
+                    } else if (m.reg->crit) {
+                        fos << " (CRIT)";
+                    } else if (m.reg->redundancy) {
+                        fos << " (RBIT-" << m.reg->redundancy << ")";
+                    }
+                }
+                if (m.reg->seq_length) {
+                    fos << " (Part " << (m.reg->seq_index + 1) << "/" << m.reg->seq_length << ")";
+                }
+                // Set the ecc and redundancy, unless the user specified values
+                do_ecc |= (m.reg->ecc && !settings.otp.raw);
+                if (redundancy < 0) redundancy = m.reg->redundancy;
+            }
+            fos << "\n";
+            if (m.reg && !settings.otp.list_no_descriptions && !m.reg->description.empty()) {
+                fos.first_column(indent0);
+                fos.hanging_indent(0);
+                fos << "\"" << m.reg->description << "\"";
+                fos.first_column(0);
+                fos << "\n";
+            }
+            fos.first_column(4);
+            fos.hanging_indent(10);
+            uint32_t raw_value = raw_buffer[m.reg_row % OTP_PAGE_ROWS];
+            char raw_buf[16 * 1024];
+            uint8_t buf_pos = 0;
+            buf_pos += snprintf(raw_buf+buf_pos, sizeof(raw_buf), "RAW_VALUE=0x%06x", raw_value);
+            for (int i=1; i < std::max(redundancy, 1); i++) {
+                raw_value = raw_buffer[(m.reg_row % OTP_PAGE_ROWS) + i];
+                buf_pos += snprintf(raw_buf+buf_pos, sizeof(raw_buf) - buf_pos, ";0x%06x", raw_value);
+                if (3 == (raw_value >> 22)) {
+                    raw_value ^= 0xffffff;
+                    snprintf(buf, sizeof(buf), "(flipping raw value to 0x%08x)", raw_value);
+                    fos << buf;
+                }
+            }
+            if (do_ecc) {
+                corrected_val = otp_calculate_ecc(raw_value &0xffff);
+                snprintf(buf, sizeof(buf), "\nVALUE 0x%06x\n", corrected_val);
+                fos << buf;
+                // todo more clarity over ECC settings
+                // todo recovery
+                if (corrected_val != raw_value) {
+                    fos << raw_buf;
+                    fos << " (WARNING - ECC IS INVALID)";
+                }
+            } else if (redundancy > 0) {
+                uint8_t sets[24] = {};
+                uint8_t clears[24] = {};
+                bool diff = false;
+                bool crit = m.reg ? m.reg->crit : false;
+                for (int i=0; i < redundancy; i++) {
+                    raw_value = raw_buffer[(m.reg_row % OTP_PAGE_ROWS) + i];
+                    for (int b=0; b < 24; b++) raw_value & (1 << b) ? sets[b]++ : clears[b]++;
+                }
+                for (int b=0; b < 24; b++){
+                    if(sets[b] >= clears[b] || (crit && sets[b] >= 3)) corrected_val |= (1 << b);
+                    if (sets[b] && clears[b]) diff = true;
+                }
+                snprintf(buf, sizeof(buf), "\nVALUE 0x%06x\n", corrected_val);
+                if (diff) {
+                    fos << raw_buf;
+                    fos << " (WARNING - REDUNDANT ROWS AREN'T EQUAL)";
+                }
+                fos << buf;
+            } else {
+                corrected_val = raw_value;
+                snprintf(buf, sizeof(buf), "\nVALUE 0x%06x\n", corrected_val);
+                fos << buf;
+            }
+            fos << "\n";
+        }
+        if (m.reg) {
+            for (const auto &f: m.reg->fields) {
+                if (f.mask & m.mask) {
+                    fos.first_column(4);
+                    fos.hanging_indent(10);
+                    // todo should we care if the fields overlap - i think this is fine for here in list
+                    int low = __builtin_ctz(f.mask);
+                    int high = 31 - __builtin_clz(f.mask);
+                    fos << "field " << f.name;
+                    if (low == high) {
+                        fos << " (bit " << low << ")";
+                    } else {
+                        fos << " (bits " << low << "-" << high << ")";
+                    }
+                    snprintf(buf, sizeof(buf), " = %x\n", (corrected_val & f.mask) >> low);
+                    fos << buf;
+                    if (!settings.otp.list_no_descriptions && !f.description.empty()) {
+                        fos.first_column(indent0);
+                        fos.hanging_indent(0);
+                        fos << "\"" << f.description << "\"";
+                        fos.first_column(0);
+                        fos << "\n";
+                    }
+                }
+            }
+        }
+    #if ENABLE_DEBUG_LOG
+        if (do_ecc) {
+            struct picoboot_otp_cmd otp_cmd;
+            otp_cmd.wRow = m.reg_row;
+            otp_cmd.bEcc = 1;
+            otp_cmd.wRowCount = 1;
+            uint16_t val = 0xaaaa;
+            con.otp_read(&otp_cmd, (uint8_t *)&val, sizeof(val));
+            snprintf(buf, sizeof(buf), "EXTRA ECC READ: %04x\n", val);
+            fos << buf;
+        }
+    #endif
+    }
+    return false;
+}
+
+bool otp_dump_command::execute(device_map &devices) {
+    // todo pre-check page lock
+    bool do_ecc = settings.otp.ecc && !settings.otp.raw;
+    vector<uint8_t> raw_buffer;
+    uint8_t row_size = do_ecc ? 2 : 4;
+    raw_buffer.resize(OTP_ROW_COUNT * row_size);
+    std::map<int, string> page_errors;
+    std::map<int, string> row_errors;
+
+    if (!settings.filenames[0].empty()) {
+        std::shared_ptr<std::fstream> file = get_file(ios::in|ios::binary);
+        if (get_file_type() != filetype::json) {
+            fail(ERROR_ARGS, "Input file must be a JSON file");
+        }
+        hack_init_otp_regs();
+        json otp_json = json::parse(*file);
+
+        // Prevent outputting to the console
+        fos_ptr = fos_null_ptr;
+        auto model = models::largest;
+
+        process_otp_json(otp_json, model,
+            [&](uint8_t *buffer, uint32_t len, picoboot_otp_cmd &otp_cmd) {
+                memset(buffer, 0, len);
+            }, [&](uint8_t *buffer, uint32_t len, picoboot_otp_cmd &otp_cmd) {
+                uint32_t offset = otp_cmd.wRow * row_size;
+                uint8_t write_row_size = len / otp_cmd.wRowCount;
+                if (otp_cmd.wRowCount * row_size == len) {
+                    memcpy(raw_buffer.data() + offset, buffer, len);
+                } else {
+                    for (int i=0; i < otp_cmd.wRowCount; i++) {
+                        if (do_ecc) {
+                            // only copy row_size bytes from the buffer, as we're ignoring the ECC bits
+                            memcpy(raw_buffer.data() + offset + i * row_size, buffer + i * write_row_size, row_size);
+                        } else {
+                            // calculate the ECC for the row and write it to the raw buffer
+                            uint32_t val = otp_calculate_ecc(*(uint16_t*)(buffer + i * write_row_size));
+                            memcpy(raw_buffer.data() + offset + i * row_size, &val, row_size);
+                        }
+                    }
+                }
+            }
+        );
+        fos_ptr = fos_base_ptr;
+    } else {
+        auto con = get_single_picoboot_cmd_compatible_device_connection("otp dump", devices, {PC_OTP_READ}, false);
+        struct picoboot_otp_cmd otp_cmd;
+        otp_cmd.bEcc = do_ecc;
+        // Read most pages by page, as permissions are per page
+        otp_cmd.wRowCount = OTP_PAGE_ROWS;
+        for (int i=0; i < OTP_PAGE_COUNT - OTP_SPECIAL_PAGES; i++) {
+            otp_cmd.wRow = i * OTP_PAGE_ROWS;
+            try {
+                con.otp_read(&otp_cmd, raw_buffer.data() + i*(raw_buffer.size() / OTP_PAGE_COUNT), raw_buffer.size() / OTP_PAGE_COUNT);
+            } catch (picoboot::command_failure& e) {
+                if (e.get_code() == PICOBOOT_NOT_PERMITTED) {
+                    page_errors[i] = e.what();
+                } else {
+                    throw e;
+                }
+            }
+        }
+
+        // Read special pages by row, as permissions are special
+        otp_cmd.wRowCount = 1;
+        for (int i=(OTP_PAGE_COUNT - OTP_SPECIAL_PAGES) * OTP_PAGE_ROWS; i < OTP_PAGE_COUNT * OTP_PAGE_ROWS; i++) {
+            otp_cmd.wRow = i;
+            try {
+                con.otp_read(&otp_cmd, raw_buffer.data() + i * row_size, row_size);
+            } catch (picoboot::command_failure& e) {
+                if (e.get_code() == PICOBOOT_NOT_PERMITTED) {
+                    row_errors[i] = e.what();
+                } else {
+                    throw e;
+                }
+            }
+        }
+    }
+
+    fos.first_column(0);
+
+    if (!settings.filenames[1].empty()) {
+        fos << "Outputting to " << settings.filenames[1] << "\n";
+        std::shared_ptr<std::fstream> file = get_file_idx(ios::out|ios::binary, 1);
+        file->write((char*)raw_buffer.data(), raw_buffer.size());
+        file->close();
+    } else {
+        char buf[256];
+        for(int i=0;i<OTP_ROW_COUNT;i+=8) {
+            if (settings.otp.dump_pages) {
+                snprintf(buf, sizeof(buf), "%02d:%02d: ", i / OTP_PAGE_ROWS, i % OTP_PAGE_ROWS);
+                fos << buf;
+            } else {
+                snprintf(buf, sizeof(buf), "%04x: ", i);
+                fos << buf;
+            }
+
+            for (int j = i; j < i + 8; j++) {
+                if (row_errors.find(j) != row_errors.end() || page_errors.find(j / OTP_PAGE_ROWS) != page_errors.end()) {
+                    snprintf(buf, sizeof(buf), "%s, ", do_ecc ? "XXXX" : "XXXXXXXX");
+                } else if (do_ecc) {
+                    snprintf(buf, sizeof(buf), "%04x, ", ((uint16_t *) raw_buffer.data())[j]);
+                } else {
+                    snprintf(buf, sizeof(buf), "%08x, ", ((uint32_t *) raw_buffer.data())[j]);
+                }
+                fos << buf;
+            }
+            fos << "\n";
+        }
+    }
+    return false;
+}
+
 bool otp_load_command::execute(device_map &devices) {
-    auto con = get_single_rp2350_bootsel_device_connection(devices, false);
+    auto con = get_single_picoboot_cmd_compatible_device_connection("otp load", devices, {PC_OTP_READ, PC_OTP_WRITE});
+    picoboot_memory_access raw_access(con);
+    auto model = raw_access.get_model();
     // todo pre-check page lock
     struct picoboot_otp_cmd otp_cmd;
     std::shared_ptr<std::fstream> file = get_file(ios::in|ios::binary);
     if (get_file_type() == filetype::json) {
-        hack_init_otp_regs(con);
+        hack_init_otp_regs();
         json otp_json = json::parse(*file);
-        int hex_val = 0;
         // todo validation on json
-        for (auto row : otp_json.items()) {
-            fos.first_column(0);
-            string row_key = row.key();
-            auto row_value = row.value();
-            fos << row_key << ":\n";
-
-            // Find matching OTP row
-            bool is_sequence = false;
-            auto row_matches = filter_otp({row_key}, 24, true);
-            if (row_matches.size() == 0) {
-                fail(ERROR_INCOMPATIBLE, "%s does not match an otp row", row_key.c_str());
-            } else if (row_matches.size() != 1) {
-                // Check if it is a sequence
-                auto row_seq0_matches = filter_otp({row_key + "0"}, 24, false);
-                auto row_seq_0_matches = filter_otp({row_key + "_0"}, 24, false);
-                if (row_seq0_matches.size() == 1) {
-                    row_matches = row_seq0_matches;
-                } else if (row_seq_0_matches.size() == 1) {
-                    row_matches = row_seq_0_matches;
+        process_otp_json(otp_json, model,
+            [&](uint8_t *buffer, uint32_t len, picoboot_otp_cmd &otp_cmd) {
+                picoboot_memory_access raw_access(con);
+                con.otp_read(&otp_cmd, buffer, len);
+            }, [&](uint8_t *buffer, uint32_t len, picoboot_otp_cmd &otp_cmd) {
+                try {
+                    con.otp_write(&otp_cmd, buffer, len);
+                } catch (picoboot::command_failure &e) {
+                    check_otp_write_error(e, otp_cmd.bEcc);
+                    throw e;
                 }
-                else if (row_matches.size() != (*row_matches.begin()).second.reg->seq_length) {
-                    for (auto x : row_matches) {
-                        DEBUG_LOG("Matches %s\n", x.second.reg->name.c_str());
-                    }
-                    fail(ERROR_INCOMPATIBLE, "%s matches multiple otp rows or sequences", row_key.c_str());
-                }
-                is_sequence = true;
-            }
-            auto row_match = *row_matches.begin();
-            auto reg = row_match.second.reg;
-            vector<uint8_t> data;
-            unsigned int row_size = 0;
-
-            fos.first_column(2);
-
-            if (reg != nullptr) {
-                otp_cmd.wRow = row_match.second.reg_row;
-                otp_cmd.wRowCount = is_sequence ? reg->seq_length : (reg->redundancy ? reg->redundancy : 1);
-                otp_cmd.bEcc = reg->ecc;
-                row_size = otp_cmd.bEcc ? 2 : 4;
-
-                // Calculate row value
-                if (row_value.is_object()) {
-                    // Specified fields
-                    struct picoboot_otp_cmd tmp_otp_cmd = otp_cmd;
-                    tmp_otp_cmd.wRowCount = 1;
-                    tmp_otp_cmd.bEcc = 0;
-                    uint32_t old_raw_value;
-                    picoboot_memory_access raw_access(con);
-                    con.otp_read(&tmp_otp_cmd, (uint8_t *)&old_raw_value, sizeof(old_raw_value));
-
-                    uint32_t reg_value = 0;
-                    uint32_t full_mask = 0;
-                    for (auto field_val : row_value.items()) {
-                        string key = field_val.key();
-                        auto value = field_val.value();
-                        if (!get_json_int(value, hex_val)) {
-                            fail(ERROR_FORMAT, "Values must be integers");
-                        }
-
-                        // Find matching OTP field
-                        auto field_matches = filter_otp({row_key + "." + key}, 24, false);
-                        if (field_matches.size() != 1) {
-                            fail(ERROR_INCOMPATIBLE, "%s is not a single otp field", key.c_str());
-                        }
-                        auto field_match = *field_matches.begin();
-                        auto field = field_match.second.field;
-
-                        fos << key << ": " << hex_string(hex_val) << "\n";
-
-                        int low = __builtin_ctz(field->mask);
-
-                        if (hex_val & (~field->mask >> low)) {
-                            fail(ERROR_NOT_POSSIBLE, "Value to set does not fit in field: value %06x, mask %06x\n", hex_val, field->mask >> low);
-                        }
-
-                        hex_val <<= low;
-                        hex_val &= field->mask;
-                        full_mask |= field->mask;
-                        reg_value |= hex_val;
-                    }
-                    reg_value |= old_raw_value & ~full_mask;
-                    vector<uint8_t> tmp((uint8_t*)(&reg_value), (uint8_t*)(&reg_value) + row_size);
-                    data.insert(data.begin(), tmp.begin(), tmp.end());
-                } else if (row_value.is_array()) {
-                    for (auto val : row_value)  {
-                        if (!get_json_int(val, hex_val)) {
-                            fail(ERROR_FORMAT, "Values must be integers");
-                        }
-                        fos << hex_string(hex_val, 2) << ", ";
-                        data.push_back(hex_val);
-                    }
-                    fos << "\n";
-                } else {
-                    if (!get_json_int(row_value, hex_val)) {
-                        fail(ERROR_FORMAT, "Values must be integers");
-                    }
-                    fos << hex_string(hex_val) << "\n";
-                    vector<uint8_t> tmp((uint8_t*)(&hex_val), (uint8_t*)(&hex_val) + row_size);
-                    data.insert(data.begin(), tmp.begin(), tmp.end());
-                }
-            } else {
-                // Must be a raw address
-                otp_cmd.wRow = row_match.second.reg_row;
-                otp_cmd.wRowCount = 1;
-                otp_cmd.bEcc = row_value["ecc"].is_boolean() ? (bool)row_value["ecc"] : false;
-                row_size = otp_cmd.bEcc ? 2 : 4;
-
-                auto val = row_value["value"];
-                if (val.is_array()) {
-                    for (auto v : val)  {
-                        if (!get_json_int(v, hex_val)) {
-                            fail(ERROR_FORMAT, "Values must be integers");
-                        }
-                        fos << hex_string(hex_val, 2) << ", ";
-                        data.push_back(hex_val);
-                    }
-                    fos << "\n";
-                    otp_cmd.wRowCount = data.size() / row_size;
-                } else {
-                    if (!get_json_int(val, hex_val)) {
-                        fail(ERROR_FORMAT, "Values must be integers");
-                    }
-                    fos << hex_string(hex_val) << "\n";
-                    vector<uint8_t> tmp((uint8_t*)(&hex_val), (uint8_t*)(&hex_val) + row_size);
-                    data.insert(data.begin(), tmp.begin(), tmp.end());
-                    if (get_json_int(row_value["redundancy"], hex_val)) otp_cmd.wRowCount = hex_val;
-                }
-            }
-
-            if (data.size() % row_size) {
-                fail(ERROR_FORMAT, "Data size must be a multiple of selected row data size (%d)", row_size);
-            }
-            if (data.size() == row_size && otp_cmd.wRowCount > 1) {
-                // Repeat the data for each redundant row
-                data.resize(otp_cmd.wRowCount * row_size);
-                for (int i=1; i < otp_cmd.wRowCount; i++) std::copy_n(data.begin(), row_size, data.begin() + row_size*i);
-            }
-
-            if (data.size() != row_size * otp_cmd.wRowCount) {
-                fail(ERROR_FORMAT, "Data size must be selected row data size * row count (%d*%d)", row_size, otp_cmd.wRowCount);
-            }
-
-            try {
-                con.otp_write(&otp_cmd, data.data(), data.size());
-            } catch (picoboot::command_failure &e) {
-                check_otp_write_error(e, otp_cmd.bEcc);
-                throw e;
-            }
-        }
+        });
 
         // Return now, don't do rest of function
         return false;
     }
     otp_cmd.wRow = settings.otp.row;
-    otp_cmd.bEcc = settings.otp.ecc && !settings.otp.raw;
+    otp_cmd.bEcc = settings_select_ecc();
     unsigned int row_size = otp_cmd.bEcc ? 2 : 4;
     file->seekg(0, ios::end);
     uint32_t file_size = file->tellg();
@@ -7109,8 +7967,7 @@ bool otp_load_command::execute(device_map &devices) {
 
     std::unique_ptr<uint8_t[]> unique_verify_buffer(new uint8_t[file_size]());
     uint8_t* verify_buffer = unique_verify_buffer.get();
-    picoboot_memory_access raw_access(con);
-    con.otp_read(&otp_cmd, (uint8_t *)verify_buffer, sizeof(verify_buffer));
+    con.otp_read(&otp_cmd, (uint8_t *)verify_buffer, file_size);
     unsigned int i;
     for(i=0;i<file_size;i++) {
         if (file_buffer[i] != verify_buffer[i]) {
@@ -7209,9 +8066,10 @@ bool otp_list_command::execute(device_map &devices) {
 
 #if HAS_LIBUSB
 bool otp_set_command::execute(device_map &devices) {
-    auto con = get_single_rp2350_bootsel_device_connection(devices, false);
-    hack_init_otp_regs(con);
-    auto matches = filter_otp(settings.otp.selectors, settings.otp.ecc ? 16 : 24, settings.otp.fuzzy);
+    auto con = get_single_picoboot_cmd_compatible_device_connection("otp set", devices, {PC_OTP_READ, PC_OTP_WRITE});
+    hack_init_otp_regs();
+    picoboot_memory_access raw_access(con);
+    auto matches = filter_otp(settings.otp.selectors, otp_cmd_max_bits(), settings.otp.fuzzy);
     // baing lazy to count
     std::set<uint32_t> unique_rows;
     std::transform(matches.begin(), matches.end(), std::inserter(unique_rows, unique_rows.begin()), [](const auto&e) { return e.first.first; });
@@ -7238,7 +8096,6 @@ bool otp_set_command::execute(device_map &devices) {
     otp_cmd.wRowCount = 1;
     otp_cmd.bEcc = 0;
     uint32_t old_raw_value;
-    picoboot_memory_access raw_access(con);
     con.otp_read(&otp_cmd, (uint8_t *)&old_raw_value, sizeof(old_raw_value));
     fos.first_column(0);
     fos.hanging_indent(7);
@@ -7324,15 +8181,14 @@ bool otp_set_command::execute(device_map &devices) {
         // OR with current value, to ignore any already-set bits
         settings.otp.value |= old_raw_value;
     }
-    // todo check for clearing bits
-    if (old_raw_value && settings.otp.ecc) {
-        fail(ERROR_NOT_POSSIBLE, "Cannot modify OTP ECC row(s)\n");
-    }
     if (~settings.otp.value & old_raw_value) {
         fail(ERROR_NOT_POSSIBLE, "Cannot clear bits in OTP row(s): current value %06x, new value %06x\n", old_raw_value, settings.otp.value);
     }
-    // todo this is currently crappy, incorrect and generally evil
-    otp_cmd.bEcc = settings.otp.ecc;
+    otp_cmd.bEcc = settings_select_ecc();
+    // todo check for clearing bits instead
+    if (old_raw_value && otp_cmd.bEcc) {
+        fail(ERROR_NOT_POSSIBLE, "Cannot modify OTP ECC row(s)\n");
+    }
     try {
         if (otp_cmd.bEcc) {
             uint16_t write_value = settings.otp.value;
@@ -7355,7 +8211,7 @@ bool otp_set_command::execute(device_map &devices) {
 }
 
 bool otp_permissions_command::execute(device_map &devices) {
-    auto con = get_single_rp2350_bootsel_device_connection(devices, false);
+    auto con = get_single_picoboot_cmd_compatible_device_connection("otp permissions", devices, {PC_OTP_READ, PC_OTP_WRITE});
 
     json perms_json = json::parse(*get_file(ios::in|ios::binary));
 
@@ -7364,7 +8220,8 @@ bool otp_permissions_command::execute(device_map &devices) {
     *tmp << file->rdbuf();
 
     auto program = get_iostream_memory_access<iostream_memory_access>(tmp, filetype::elf, true);
-    program.set_model(rp2350);
+    // todo what do we need from this model - if it is generic, we should make a generic one
+    program.set_model(std::make_unique<model_rp2350>());
 
     settings.config.group = "otp_page_permissions";
     for (auto it = perms_json.begin(); it != perms_json.end(); ++it) {
@@ -7499,8 +8356,8 @@ void wl_do_field(json json_data, vector<uint16_t>& data, uint32_t& flags, const 
 }
 
 bool otp_white_label_command::execute(device_map &devices) {
-    auto con = get_single_rp2350_bootsel_device_connection(devices, false);
-    hack_init_otp_regs(con);
+    auto con = get_single_picoboot_cmd_compatible_device_connection("otp white-label", devices, {PC_OTP_READ, PC_OTP_WRITE});
+    hack_init_otp_regs();
     const otp_reg* flags_reg;
     const otp_reg* addr_reg;
     {
@@ -7664,7 +8521,7 @@ bool reboot_command::execute(device_map &devices) {
         if (!settings.switch_cpu.empty()) {
             fail(ERROR_ARGS, "--cpu may not be specified for forced reboot");
         }
-        selected_model = std::get<0>(devices[dr_vidpid_stdio_usb][0]);
+        selected_chip = std::get<0>(devices[dr_vidpid_stdio_usb][0]);
         reboot_device(std::get<1>(devices[dr_vidpid_stdio_usb][0]), std::get<2>(devices[dr_vidpid_stdio_usb][0]), settings.reboot_usb);
         if (!quiet) {
             if (settings.reboot_usb) {
@@ -7678,8 +8535,8 @@ bool reboot_command::execute(device_map &devices) {
         // care what else is happening.
         auto con = get_single_bootsel_device_connection(devices, false);
         picoboot_memory_access raw_access(con);
-        model_t model = get_model(raw_access);
-        if (model == rp2350) {
+        model_t model = raw_access.get_model();
+        if (model->supports_picoboot_cmd(PC_REBOOT2)) {
             struct picoboot_reboot2_cmd cmd = {
                     .dFlags = (uint8_t)(settings.reboot_usb ? REBOOT2_FLAG_REBOOT_TYPE_BOOTSEL : REBOOT2_FLAG_REBOOT_TYPE_NORMAL),
                     .dDelayMS = 500,
@@ -7711,7 +8568,7 @@ bool reboot_command::execute(device_map &devices) {
             std::vector<uint32_t> program = {
                     0x20002100, // movs r0, #0;       movs r1, #0
                     0x47104a00, // ldr  r2, [pc, #0]; bx r2
-                    bootrom_func_lookup(raw_access, rom_table_code('U', 'B'))
+                    bootrom_func_lookup_rp2040(raw_access, rom_table_code('U', 'B'))
             };
 
             raw_access.write_vector(program_base, program);
@@ -7761,7 +8618,10 @@ static void sleep_ms(int ms) {
 }
 
 void get_terminal_size(int& width, int& height) {
-#if defined(_WIN32)
+#if defined(DOCS_WIDTH)
+    width = DOCS_WIDTH;
+    height = 24;
+#elif defined(_WIN32)
     CONSOLE_SCREEN_BUFFER_INFO csbi;
     GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi);
     width = (int)(csbi.dwSize.X);
@@ -7835,13 +8695,13 @@ int main(int argc, char **argv) {
                     if (settings.bus != -1 && settings.bus != libusb_get_bus_number(*dev)) continue;
                     if (settings.address != -1 && settings.address != libusb_get_device_address(*dev)) continue;
                     libusb_device_handle *handle = nullptr;
-                    model_t model = unknown;
-                    auto result = picoboot_open_device(*dev, &handle, &model, settings.vid, settings.pid, settings.ser.c_str());
+                    chip_t chip = unknown;
+                    auto result = picoboot_open_device(*dev, &handle, &chip, settings.vid, settings.pid, settings.ser.c_str());
                     if (handle) {
                         to_close.push_back(handle);
                     }
                     if (result != dr_error) {
-                        devices[result].emplace_back(std::make_tuple(model, *dev, handle));
+                        devices[result].emplace_back(std::make_tuple(chip, *dev, handle));
                     }
                 }
             }
@@ -8002,28 +8862,14 @@ int main(int argc, char **argv) {
                 break;
             }
         }
-    } catch (command_failure &e) {
+    } catch (failure_error &e) {
         std::cout << "ERROR: " << e.what() << "\n";
         rc = e.code();
     } catch (picoboot::command_failure& e) {
-        // todo rp2350/rp2040
-        string device = "RP-series";
-        if (selected_model == rp2040) {
-            device = "RP2040";
-        } else if (selected_model == rp2350) {
-            device = "RP2350";
-        }
-        std::cout << "ERROR: The " << device << " device returned an error: " << e.what() << "\n";
+        std::cout << "ERROR: The " << chip_name(selected_chip) << " device returned an error: " << e.what() << "\n";
         rc = ERROR_UNKNOWN;
     } catch (picoboot::connection_error&) {
-        // todo rp2350/rp2040
-        string device = "RP-series";
-        if (selected_model == rp2040) {
-            device = "RP2040";
-        } else if (selected_model == rp2350) {
-            device = "RP2350";
-        }
-        std::cout << "ERROR: Communication with " << device << " device failed\n";
+        std::cout << "ERROR: Communication with " << chip_name(selected_chip) << " device failed\n";
         rc = ERROR_CONNECTION;
     } catch (cancelled_exception&) {
         rc = ERROR_CANCELLED;
@@ -8046,7 +8892,7 @@ int main(int argc, char **argv) {
     }
     try {
         rc = selected_cmd->execute(devices);
-    } catch (command_failure &e) {
+    } catch (failure_error &e) {
         std::cout << "ERROR: " << e.what() << "\n";
         rc = e.code();
     } catch (cancelled_exception&) {
